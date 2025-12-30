@@ -281,8 +281,8 @@ def parse_args():
     # Training Hyperparams
     parser.add_argument("-e", "--epochs", type=int, default=400)
     parser.add_argument("-b", "--batch_size", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--aux_lr", dest="aux_learning_rate", type=float, default=1e-3)
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--aux_learning_rate", dest="aux_learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--clip_max_norm", type=float, default=1.0)
     parser.add_argument("--lmbda", type=float, default=0.0130, help="Rate-distortion parameter")
