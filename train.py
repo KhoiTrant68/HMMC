@@ -28,7 +28,7 @@ from torchvision.utils import make_grid
 
 # Local Modules
 # Ensure your directory structure is correct: models/hdmc.py
-from models.hdmc import HDMC
+from model.hdmc import HDMC
 from loss.loss import AverageMeter, RateDistortionLoss
 
 
