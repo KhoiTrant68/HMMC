@@ -26,7 +26,7 @@ from compressai.datasets import ImageFolder
 from timm.utils import ModelEmaV2
 
 # Local Imports (Ensure these files exist based on previous steps)
-from model.hdmc import HDMC_Mamba
+from model.hdmc import HDMC
 from loss.loss import RateDistortionLoss, AverageMeter
 
 # =========================================================
@@ -34,7 +34,7 @@ from loss.loss import RateDistortionLoss, AverageMeter
 # =========================================================
 class LossFreeBalancer:
     """
-    Optimized for EfficientMoELayer in HDMC_Mamba.
+    Optimized for EfficientMoELayer in HDMC.
     """
     def __init__(self, update_rate=0.001):
         self.update_rate = update_rate
@@ -346,7 +346,7 @@ def main():
 
     # 4. Model Initialization
     # N=192, M=320 are the standard "Base" configuration for CompressAI-like models
-    model = HDMC_Mamba(N=192, M=320)
+    model = HDMC(N=192, M=320)
     
     # EMA Model (Shadow copy for validation/inference)
     ema_model = ModelEmaV2(model, decay=0.999)
