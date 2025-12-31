@@ -18,7 +18,7 @@ except ImportError:
     print("Please install pytorch-msssim: pip install pytorch-msssim")
     sys.exit(1)
 
-from model.hdmc import HDMC
+from model.HMMC import HMMC
 
 warnings.filterwarnings("ignore")
 
@@ -79,7 +79,7 @@ def crop(x, padding):
 
 
 def parse_args(argv):
-    parser = argparse.ArgumentParser(description="HDMC Evaluation Script")
+    parser = argparse.ArgumentParser(description="HMMC Evaluation Script")
     parser.add_argument(
         "--checkpoint", type=str, required=True, help="Path to checkpoint",
     )
@@ -129,7 +129,7 @@ def main(argv):
     # Load Model
     print(f"Loading model from {args.checkpoint}...")
     # Initialize model with same params as training
-    net = HDMC(N=192, M=320).to(device)
+    net = HMMC(N=192, M=320).to(device)
 
     # Load Checkpoint
     checkpoint = torch.load(args.checkpoint, map_location=device)

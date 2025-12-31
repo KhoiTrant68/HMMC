@@ -440,7 +440,7 @@ class CheckerboardMerger(nn.Module):
 # PART 5: INTEGRATED MODEL
 # ==========================================
 
-class HDMC(CompressionModel):
+class HMMC(CompressionModel):
     def __init__(
         self,
         N=192,

@@ -27,8 +27,8 @@ from torchvision import transforms
 from torchvision.utils import make_grid
 
 # Local Modules
-# Ensure your directory structure is correct: models/hdmc.py
-from model.hdmc import HDMC
+# Ensure your directory structure is correct: models/hmmc.py
+from model.hmmc import HMMC
 from loss.loss import AverageMeter, RateDistortionLoss
 
 
@@ -50,7 +50,7 @@ class LossFreeBalancer:
     def update_biases(self, model, router_data_tuple, accelerator=None):
         """
         Args:
-            model: Unwrapped HDMC model.
+            model: Unwrapped HMMC model.
             router_data_tuple: Tuple of (logits, indices) from forward pass.
             accelerator: For syncing counts across GPUs.
         """
@@ -96,8 +96,8 @@ class LossFreeBalancer:
 
     def _get_module_by_index(self, model, index):
         """
-        Maps the flat index from `all_logits` to the specific MoE module in HDMC.
-        Forward order in HDMC:
+        Maps the flat index from `all_logits` to the specific MoE module in HMMC.
+        Forward order in HMMC:
         1. Standard Slices (dt_cross_attention list)
         2. Anchor (moe_anchor)
         3. Non-Anchor (moe_non_anchor)
@@ -301,7 +301,7 @@ def save_checkpoint(state, is_best, save_path, filename="checkpoint.pth.tar"):
 # =========================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="HDMC Training")
+    parser = argparse.ArgumentParser(description="HMMC Training")
     parser.add_argument(
         "-d", "--dataset", type=str, required=True, help="Path to ImageFolder root"
     )
@@ -380,7 +380,7 @@ def main():
     )
 
     # 4. Initialize Model
-    net = HDMC(N=192, M=320)
+    net = HMMC(N=192, M=320)
 
     # Initialize EMA
     ema_model = ModelEmaV2(net, decay=0.999)
