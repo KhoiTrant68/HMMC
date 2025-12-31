@@ -11,7 +11,7 @@ with open("scripts/openimage.yaml", "r") as f:
 
 fo.config.dataset_zoo_dir = data["path"]
 
-map_amount = {"train": 20000, "validation": 1000}
+map_amount = {"train": 1000, "validation": 100}
 name = "open-images-v7"
 
 OUTPUT_ROOT = "./dataset"
