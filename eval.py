@@ -18,7 +18,7 @@ except ImportError:
     print("Please install pytorch-msssim: pip install pytorch-msssim")
     sys.exit(1)
 
-from model.HMMC import HMMC
+from model.hmmc import HMMC
 
 warnings.filterwarnings("ignore")
 

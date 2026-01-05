@@ -362,7 +362,7 @@ def main():
     # IMPORTANT: Ensure your dataset has 'train' and 'test' folders.
     # If your folder is named 'valid', change split="test" to split="valid" below.
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
-    test_dataset = ImageFolder(args.dataset, split="test", transform=test_transforms)
+    test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
     train_dataloader = DataLoader(
         train_dataset,
