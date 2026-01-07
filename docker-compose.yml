@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  trainer:
+    build: .
+    container_name: ai_trainer
+    shm_size: "16gb"
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./:/workspace
+    command: >
+      bash -c '
+        for L in 0.05 0.025 0.013 0.0067 0.0035 0.0018; do
+            echo "Running lambda = $L"
+            accelerate launch --mixed_precision="fp16" train.py -d dataset --save_path output --num_workers 2 --epochs 100 --batch_size 4 --lmbda ${L}
+        done
+      '
