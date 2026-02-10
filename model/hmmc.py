@@ -9,24 +9,25 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 from compressai.models.utils import update_registered_buffers
 
-# Assumed external modules
 from modules.conv_module import (
     ConvBottleneckBlockWithStride,
     ConvBottleneckBlockWithUpsample,
 )
-# Assuming SS2D is available from your Code 2 environment
-from modules.VSS_module import SS2D 
+from modules.VSS_module import SS2D
 
 
 # ==========================================
 # PART 1: HELPER FUNCTIONS & BLOCKS
 # ==========================================
 
+
 def ste_round(x):
     return torch.round(x) - x.detach() + x
 
+
 def get_scale_table(min=0.11, max=256, levels=64):
     return torch.exp(torch.linspace(math.log(min), math.log(max), levels))
+
 
 class LayerNorm2d(nn.Module):
     def __init__(self, channels, eps=1e-6):
@@ -42,10 +43,12 @@ class LayerNorm2d(nn.Module):
         x = self.weight[:, None, None] * x + self.bias[:, None, None]
         return x
 
+
 class SimpleGate(nn.Module):
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
+
 
 class Scale(nn.Module):
     def __init__(self, dim, init_value=1.0, trainable=True):
@@ -55,20 +58,69 @@ class Scale(nn.Module):
     def forward(self, x):
         # Automatically handle NCHW vs NHWC broadcasting
         if x.dim() == 4 and x.shape[1] == self.scale.shape[0]:
-             # NCHW: (B, C, H, W) * (C) -> reshape scale to (1, C, 1, 1)
-             return x * self.scale.view(1, -1, 1, 1)
-        
+            # NCHW: (B, C, H, W) * (C) -> reshape scale to (1, C, 1, 1)
+            return x * self.scale.view(1, -1, 1, 1)
+
         # Standard broadcasting (NHWC or others)
         return x * self.scale
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        return x + self.conv(x)
+
+
+class EntropyTransform(nn.Module):
+    """Deep transform for Mean/Scale prediction"""
+
+    def __init__(self, in_dim, out_dim, hidden_dim=224):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 3, 1, 1),
+            nn.GELU(),
+            ResBlock(hidden_dim),
+            ResBlock(hidden_dim),
+            nn.Conv2d(hidden_dim, out_dim, 3, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 
 # ==========================================
 # PART 2: MAMBA BACKBONE
 # ==========================================
 
+class ChannelAttention(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
 class MambaBlock(nn.Module):
     """
     Wrapper for SS2D (Mamba) to replace Swin Blocks.
     """
+
     def __init__(
         self,
         dim,
@@ -90,16 +142,17 @@ class MambaBlock(nn.Module):
             forward_type="v2",
         )
         self.norm = LayerNorm2d(dim)
+        self.ca = ChannelAttention(dim) 
 
     def forward(self, x):
-        # Input: (B, C, H, W)
         shortcut = x
-        # SS2D expects (B, H, W, C)
-        x = x.permute(0, 2, 3, 1)
-        x = self.mamba(x)
-        x = x.permute(0, 3, 1, 2)
-        x = self.norm(x)
+        x_perm = x.permute(0, 2, 3, 1)
+        x_res = self.mamba(x_perm)
+        x_res = x_res.permute(0, 3, 1, 2)
+        x_res = self.norm(x_res)
+        x_res = self.ca(x_res)
         return x + shortcut
+
 
 class MambaBlockSequence(nn.Module):
     def __init__(
@@ -112,27 +165,35 @@ class MambaBlockSequence(nn.Module):
         drop_path=0.0,
     ):
         super().__init__()
-        self.blocks = nn.ModuleList([
-            MambaBlock(
-                dim=input_dim,
-                ssm_ratio=ssm_ratio,
-                d_state=d_state,
-                drop_path=drop_path,
-            )
-            for _ in range(num_blocks)
-        ])
-        
-        self.proj = nn.Conv2d(input_dim, output_dim, 1) if input_dim != output_dim else nn.Identity()
-        
+        self.blocks = nn.ModuleList(
+            [
+                MambaBlock(
+                    dim=input_dim,
+                    ssm_ratio=ssm_ratio,
+                    d_state=d_state,
+                    drop_path=drop_path,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+        self.proj = (
+            nn.Conv2d(input_dim, output_dim, 1)
+            if input_dim != output_dim
+            else nn.Identity()
+        )
+
     def forward(self, x):
         for block in self.blocks:
             x = block(x)
         x = self.proj(x)
         return x
 
+
 # ==========================================
 # PART 3: ADVANCED ENTROPY BLOCKS
 # ==========================================
+
 
 class NAFBlock(nn.Module):
     def __init__(self, dim, inter_dim=None):
@@ -188,6 +249,7 @@ class NAFBlock(nn.Module):
         out = self.out_conv(out)
         return out
 
+
 class LiftingBlock(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -201,6 +263,7 @@ class LiftingBlock(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
 
 class LearnableWaveletTransform(nn.Module):
     def __init__(self, in_channels):
@@ -225,6 +288,7 @@ class LearnableWaveletTransform(nn.Module):
 
         hf = torch.cat([h_ll, lh, h_hh], dim=1)
         return ll, hf
+
 
 class InverseLearnableWaveletTransform(nn.Module):
     def __init__(self, in_channels):
@@ -257,17 +321,25 @@ class InverseLearnableWaveletTransform(nn.Module):
         x = self._inverse_lifting(l_horz, h_horz, self.P_horz, self.U_horz, dim=3)
         return x
 
+
 class MultiScaleAggregation(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.s = nn.Conv2d(dim, dim, 1)
         self.spatial_atte = nn.Sequential(
-             nn.Conv2d(2, 1, 7, padding=3, bias=False),
-             nn.Sigmoid()
+            nn.Conv2d(2, 1, 7, padding=3, bias=False), nn.Sigmoid()
         )
         self.dense = nn.Sequential(
-            nn.Sequential(nn.GELU(), nn.Conv2d(dim, dim, 3, 1, 1, groups=dim), nn.Conv2d(dim, dim, 1)),
-            nn.Sequential(nn.GELU(), nn.Conv2d(dim, dim, 3, 1, 1, groups=dim), nn.Conv2d(dim, dim, 1)),
+            nn.Sequential(
+                nn.GELU(),
+                nn.Conv2d(dim, dim, 3, 1, 1, groups=dim),
+                nn.Conv2d(dim, dim, 1),
+            ),
+            nn.Sequential(
+                nn.GELU(),
+                nn.Conv2d(dim, dim, 3, 1, 1, groups=dim),
+                nn.Conv2d(dim, dim, 1),
+            ),
             nn.Conv2d(dim, dim, 1),
         )
 
@@ -279,6 +351,7 @@ class MultiScaleAggregation(nn.Module):
         max_out, _ = torch.max(s_out, dim=1, keepdim=True)
         s_attn = self.spatial_atte(torch.cat([avg_out, max_out], dim=1))
         return s_out * s_attn
+
 
 class SpectralMoEDictionaryCrossAttention(nn.Module):
     def __init__(
@@ -333,15 +406,22 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
         # Utils - UPDATED: Use LayerNorm2d for NCHW flow
         self.msa = MultiScaleAggregation(c_block)
-        self.ln_scale = LayerNorm2d(c_block) 
+        self.ln_scale = LayerNorm2d(c_block)
         self.res_scale_1 = Scale(c_block, init_value=1.0)
-        
+
         self.ln_mlp = LayerNorm2d(c_block)
         self.mlp = nn.Sequential(
-            nn.Conv2d(c_block, c_block * mlp_rate, 1), 
-            nn.Conv2d(c_block*mlp_rate, c_block*mlp_rate, 3, 1, 1, groups=c_block*mlp_rate),
+            nn.Conv2d(c_block, c_block * mlp_rate, 1),
+            nn.Conv2d(
+                c_block * mlp_rate,
+                c_block * mlp_rate,
+                3,
+                1,
+                1,
+                groups=c_block * mlp_rate,
+            ),
             nn.GELU(),
-            nn.Conv2d(c_block*mlp_rate, c_block, 1)
+            nn.Conv2d(c_block * mlp_rate, c_block, 1),
         )
         self.res_scale_2 = Scale(c_block, init_value=1.0)
 
@@ -404,27 +484,32 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
         # Utils (Flow is NCHW)
         recon = recon + self.res_scale_1(self.msa(self.ln_scale(recon)))
-        recon = recon + self.res_scale_2(self.mlp(self.ln_mlp(recon))) 
-        
+        recon = recon + self.res_scale_2(self.mlp(self.ln_mlp(recon)))
+
         # Output Linear expects NHWC
-        out = self.output_trans(recon.permute(0, 2, 3, 1)) 
+        out = self.output_trans(recon.permute(0, 2, 3, 1))
         out = out.permute(0, 3, 1, 2)
-        
+
         if self.input_dim == self.output_dim:
             out = out + shortcut
         return out
 
+
 # ==========================================
 # PART 4: CHECKERBOARD LOGIC
 # ==========================================
+
 
 class CheckerboardSplitter(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         x_reshaped = x.view(B, C, H // 2, 2, W // 2, 2).permute(0, 1, 2, 4, 3, 5)
         anchor = x_reshaped[..., 0, 0]
-        non_anchor = torch.cat([x_reshaped[..., 0, 1], x_reshaped[..., 1, 0], x_reshaped[..., 1, 1]], dim=1)
+        non_anchor = torch.cat(
+            [x_reshaped[..., 0, 1], x_reshaped[..., 1, 0], x_reshaped[..., 1, 1]], dim=1
+        )
         return anchor, non_anchor
+
 
 class CheckerboardMerger(nn.Module):
     def forward(self, anchor, non_anchor):
@@ -436,9 +521,11 @@ class CheckerboardMerger(nn.Module):
         x = grid.permute(0, 1, 2, 4, 3, 5)
         return x.reshape(B, C, H_half * 2, W_half * 2)
 
+
 # ==========================================
 # PART 5: INTEGRATED MODEL
 # ==========================================
+
 
 class HMMC(CompressionModel):
     def __init__(
@@ -454,18 +541,23 @@ class HMMC(CompressionModel):
         self.num_standard_slices = len(self.groups) - 2
         self.last_slice_dim = self.groups[-1]
 
-        # BACKBONE: MAMBA
         feature_dim = [96, 144, 256]
-        block_counts = [2, 3, 6] 
+        block_counts = [2, 3, 6]
 
         # Encoder
         self.g_a = nn.Sequential(
             ConvBottleneckBlockWithStride(3, feature_dim[0]),
-            MambaBlockSequence(feature_dim[0], feature_dim[0], num_blocks=block_counts[0]),
+            MambaBlockSequence(
+                feature_dim[0], feature_dim[0], num_blocks=block_counts[0]
+            ),
             ConvBottleneckBlockWithStride(feature_dim[0], feature_dim[1]),
-            MambaBlockSequence(feature_dim[1], feature_dim[1], num_blocks=block_counts[1]),
+            MambaBlockSequence(
+                feature_dim[1], feature_dim[1], num_blocks=block_counts[1]
+            ),
             ConvBottleneckBlockWithStride(feature_dim[1], feature_dim[2]),
-            MambaBlockSequence(feature_dim[2], feature_dim[2], num_blocks=block_counts[2]),
+            MambaBlockSequence(
+                feature_dim[2], feature_dim[2], num_blocks=block_counts[2]
+            ),
             nn.Conv2d(feature_dim[2], M, kernel_size=5, stride=2, padding=2),
         )
 
@@ -474,11 +566,17 @@ class HMMC(CompressionModel):
             nn.ConvTranspose2d(
                 M, feature_dim[2], kernel_size=5, stride=2, output_padding=1, padding=2
             ),
-            MambaBlockSequence(feature_dim[2], feature_dim[2], num_blocks=block_counts[2]),
+            MambaBlockSequence(
+                feature_dim[2], feature_dim[2], num_blocks=block_counts[2]
+            ),
             ConvBottleneckBlockWithUpsample(feature_dim[2], feature_dim[1]),
-            MambaBlockSequence(feature_dim[1], feature_dim[1], num_blocks=block_counts[1]),
+            MambaBlockSequence(
+                feature_dim[1], feature_dim[1], num_blocks=block_counts[1]
+            ),
             ConvBottleneckBlockWithUpsample(feature_dim[1], feature_dim[0]),
-            MambaBlockSequence(feature_dim[0], feature_dim[0], num_blocks=block_counts[0]),
+            MambaBlockSequence(
+                feature_dim[0], feature_dim[0], num_blocks=block_counts[0]
+            ),
             ConvBottleneckBlockWithUpsample(feature_dim[0], 3),
         )
 
@@ -529,20 +627,8 @@ class HMMC(CompressionModel):
             support_dim = M + (M * 2) + cum_channels
             self.context_transforms.append(NAFBlock(support_dim, inter_dim=128))
 
-            self.mean_transforms.append(
-                nn.Sequential(
-                    nn.Conv2d(support_dim, 224, 3, 1, 1),
-                    nn.GELU(),
-                    nn.Conv2d(224, current_dim, 3, 1, 1),
-                )
-            )
-            self.scale_transforms.append(
-                nn.Sequential(
-                    nn.Conv2d(support_dim, 224, 3, 1, 1),
-                    nn.GELU(),
-                    nn.Conv2d(224, current_dim, 3, 1, 1),
-                )
-            )
+            self.mean_transforms.append(EntropyTransform(support_dim, current_dim))
+            self.scale_transforms.append(EntropyTransform(support_dim, current_dim))
             self.lrp_transforms.append(
                 nn.Sequential(
                     nn.Conv2d(support_dim + current_dim, 224, 3, 1, 1),
@@ -649,10 +735,12 @@ class HMMC(CompressionModel):
 
             dict_info = self.dt_cross_attention[i](query)
             if hasattr(self.dt_cross_attention[i], "last_routing_logits"):
-                all_logits.append((
-                    self.dt_cross_attention[i].last_routing_logits,
-                    self.dt_cross_attention[i].last_routing_indices,
-                ))
+                all_logits.append(
+                    (
+                        self.dt_cross_attention[i].last_routing_logits,
+                        self.dt_cross_attention[i].last_routing_indices,
+                    )
+                )
 
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
@@ -674,7 +762,7 @@ class HMMC(CompressionModel):
             lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[i](lrp_in)
             y_hat_slice = y_hat_slice + (0.5 * torch.tanh(lrp))
-            
+
             y_hat_slices.append(y_hat_slice)
 
         # B. Checkerboard
@@ -689,11 +777,13 @@ class HMMC(CompressionModel):
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_info_anc = self.moe_anchor(query_anc)
         if hasattr(self.moe_anchor, "last_routing_logits"):
-            all_logits.append((
-                self.moe_anchor.last_routing_logits,
-                self.moe_anchor.last_routing_indices,
-            ))
-        
+            all_logits.append(
+                (
+                    self.moe_anchor.last_routing_logits,
+                    self.moe_anchor.last_routing_indices,
+                )
+            )
+
         support_anc = torch.cat([dict_info_anc, query_anc], dim=1)
         feat_anc = self.naf_anchor(support_anc)
         mu_anc = self.mean_anchor(feat_anc)
@@ -712,10 +802,12 @@ class HMMC(CompressionModel):
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_info_na = self.moe_non_anchor(query_na)
         if hasattr(self.moe_non_anchor, "last_routing_logits"):
-            all_logits.append((
-                self.moe_non_anchor.last_routing_logits,
-                self.moe_non_anchor.last_routing_indices,
-            ))
+            all_logits.append(
+                (
+                    self.moe_non_anchor.last_routing_logits,
+                    self.moe_non_anchor.last_routing_indices,
+                )
+            )
 
         support_na = torch.cat([dict_info_na, query_na], dim=1)
         feat_na = self.naf_non_anchor(support_na)
@@ -734,7 +826,7 @@ class HMMC(CompressionModel):
         # Merge
         y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
         y_lik_last = self.checkerboard_merge(y_lik_anc, y_lik_na)
-        
+
         y_hat_slices.append(y_hat_last)
         y_likelihood.append(y_lik_last)
 
@@ -907,10 +999,9 @@ class HMMC(CompressionModel):
         rv_anc = decoder.decode_stream(
             index_anc.reshape(-1).tolist(), cdf, cdf_lengths, offsets
         )
-        rv_anc = (
-            torch.tensor(rv_anc, dtype=torch.float32, device=mu_anc.device)
-            .reshape(1, self.last_slice_dim, y_shape[0] // 2, y_shape[1] // 2)
-        )
+        rv_anc = torch.tensor(
+            rv_anc, dtype=torch.float32, device=mu_anc.device
+        ).reshape(1, self.last_slice_dim, y_shape[0] // 2, y_shape[1] // 2)
         y_hat_anc = self.gaussian_conditional.dequantize(rv_anc, mu_anc)
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
@@ -927,9 +1018,8 @@ class HMMC(CompressionModel):
         rv_na = decoder.decode_stream(
             index_na.reshape(-1).tolist(), cdf, cdf_lengths, offsets
         )
-        rv_na = (
-            torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device)
-            .reshape(1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2)
+        rv_na = torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device).reshape(
+            1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2
         )
         y_hat_na = self.gaussian_conditional.dequantize(rv_na, mu_na)
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))

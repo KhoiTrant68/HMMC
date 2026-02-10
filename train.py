@@ -11,14 +11,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-# Accelerate
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-# CompressAI
 from compressai.datasets import ImageFolder
 
-# SOTA Utils
 from timm.utils import ModelEmaV2
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -26,8 +23,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 from torchvision.utils import make_grid
 
-# Local Modules
-# Ensure your directory structure is correct: models/hmmc.py
 from model.hmmc import HMMC
 from loss.loss import AverageMeter, RateDistortionLoss
 
@@ -88,7 +83,7 @@ class LossFreeBalancer:
 
             if moe_module is not None and hasattr(moe_module, "expert_biases"):
                 update_step = self.update_rate * torch.sign(error)
-                
+
                 # In-place update (biases usually have requires_grad=False)
                 # Ensure device compatibility
                 device = moe_module.expert_biases.device
@@ -103,9 +98,9 @@ class LossFreeBalancer:
         3. Non-Anchor (moe_non_anchor)
         """
         # Safety check if attribute exists
-        if not hasattr(model, 'dt_cross_attention'):
+        if not hasattr(model, "dt_cross_attention"):
             return None
-            
+
         num_standard = len(model.dt_cross_attention)
 
         if index < num_standard:
@@ -120,6 +115,7 @@ class LossFreeBalancer:
 # =========================================================
 #  LOGGING & SETUP
 # =========================================================
+
 
 def setup_logger(log_dir):
     logger = logging.getLogger("Train")
@@ -140,8 +136,7 @@ def setup_logger(log_dir):
 def configure_optimizers(net, args):
     """Separates parameters for Main Optimizer (AdamW) and Aux Optimizer (Adam)."""
     params_dict = dict(net.named_parameters())
-    
-    # CompressAI: Entropy parameters end with .quantiles
+
     params = {n: p for n, p in params_dict.items() if not n.endswith(".quantiles")}
     aux_params = {n: p for n, p in params_dict.items() if n.endswith(".quantiles")}
 
@@ -164,6 +159,7 @@ def configure_optimizers(net, args):
 #  TRAINING LOOP
 # =========================================================
 
+
 def train_one_epoch(
     model,
     criterion,
@@ -178,6 +174,7 @@ def train_one_epoch(
     global_step,
     balancer,
     ema_model,
+    training_mode,
     args,
 ):
     model.train()
@@ -194,7 +191,7 @@ def train_one_epoch(
         aux_optimizer.zero_grad()
 
         # 1. Forward Pass (Noise Injection Mode)
-        out_net = model(batch, training_mode="noise")
+        out_net = model(batch, training_mode=training_mode)
 
         # 2. Compute Loss
         out_criterion = criterion(out_net, batch)
@@ -213,7 +210,9 @@ def train_one_epoch(
 
         # 4. LOSS-FREE BALANCING UPDATE (Fixes AttributeError)
         if "router_logits" in out_net and out_net["router_logits"]:
-            balancer.update_biases(unwrapped_model, out_net["router_logits"], accelerator)
+            balancer.update_biases(
+                unwrapped_model, out_net["router_logits"], accelerator
+            )
 
         # 5. Aux Loss
         aux_loss = unwrapped_model.aux_loss()
@@ -238,11 +237,15 @@ def train_one_epoch(
             writer.add_scalar("Train/Bpp", bpp_meter.val, global_step)
             writer.add_scalar("Train/MSE", dist_meter.val, global_step)
 
-            if not bias_stats_logged and hasattr(unwrapped_model, 'dt_cross_attention'):
+            if not bias_stats_logged and hasattr(unwrapped_model, "dt_cross_attention"):
                 if hasattr(unwrapped_model.dt_cross_attention[0], "expert_biases"):
                     biases = unwrapped_model.dt_cross_attention[0].expert_biases
-                    writer.add_scalar("Debug/Bias_Max", biases.max().item(), global_step)
-                    writer.add_scalar("Debug/Bias_Min", biases.min().item(), global_step)
+                    writer.add_scalar(
+                        "Debug/Bias_Max", biases.max().item(), global_step
+                    )
+                    writer.add_scalar(
+                        "Debug/Bias_Min", biases.min().item(), global_step
+                    )
                     bias_stats_logged = True
 
         global_step += 1
@@ -300,6 +303,7 @@ def save_checkpoint(state, is_best, save_path, filename="checkpoint.pth.tar"):
 #  MAIN ENTRY
 # =========================================================
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="HMMC Training")
     parser.add_argument(
@@ -313,9 +317,11 @@ def parse_args():
     parser.add_argument("--lr", dest="learning_rate", type=float, default=1e-4)
     parser.add_argument("--aux-lr", dest="aux_learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--lmbda", type=float, default=0.0130, help="Lagrange multiplier")
+    parser.add_argument(
+        "--lmbda", type=float, default=0.0130, help="Lagrange multiplier"
+    )
     parser.add_argument("--clip_max_norm", type=float, default=1.0)
-    
+
     # Balancing
     parser.add_argument("--update_rate", type=float, default=0.001)
 
@@ -349,18 +355,17 @@ def main():
         logger.info(f"Training Config: {args}")
 
     # 3. Data Loading
-    train_transforms = transforms.Compose([
-        transforms.RandomCrop(args.patch_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-    ])
-    test_transforms = transforms.Compose([
-        transforms.CenterCrop(args.patch_size),
-        transforms.ToTensor()
-    ])
+    train_transforms = transforms.Compose(
+        [
+            transforms.RandomCrop(args.patch_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]
+    )
+    test_transforms = transforms.Compose(
+        [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
+    )
 
-    # IMPORTANT: Ensure your dataset has 'train' and 'test' folders.
-    # If your folder is named 'valid', change split="test" to split="valid" below.
     train_dataset = ImageFolder(args.dataset, split="train", transform=train_transforms)
     test_dataset = ImageFolder(args.dataset, split="valid", transform=test_transforms)
 
@@ -416,8 +421,15 @@ def main():
             best_loss = checkpoint["loss"]
 
     # 9. Prepare
-    net, optimizer, aux_optimizer, train_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        net, optimizer, aux_optimizer, train_dataloader, test_dataloader, lr_scheduler
+    net, optimizer, aux_optimizer, train_dataloader, test_dataloader, lr_scheduler = (
+        accelerator.prepare(
+            net,
+            optimizer,
+            aux_optimizer,
+            train_dataloader,
+            test_dataloader,
+            lr_scheduler,
+        )
     )
 
     # EMA to device
@@ -425,20 +437,46 @@ def main():
 
     # 10. Loop
     global_step = start_epoch * len(train_dataloader)
-    
+
     for epoch in range(start_epoch, args.epochs):
+        if epoch < args.epochs * 0.75:
+            training_mode = "noise"
+        else:
+            training_mode = "ste"
+
+        if epoch == int(args.epochs * 0.75):
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = args.learning_rate * 0.1
+            if accelerator.is_main_process:
+                print(">>> Switching to STE quantization and lowering LR")
+
         global_step = train_one_epoch(
-            net, criterion, train_dataloader, optimizer, aux_optimizer,
-            epoch, args.clip_max_norm, accelerator, logger, writer, global_step, balancer, ema_model, args
+            net,
+            criterion,
+            train_dataloader,
+            optimizer,
+            aux_optimizer,
+            epoch,
+            args.clip_max_norm,
+            accelerator,
+            logger,
+            writer,
+            global_step,
+            balancer,
+            ema_model,
+            training_mode,
+            args,
         )
 
-        loss = test_epoch(epoch, test_dataloader, net, criterion, accelerator, logger, writer)
+        loss = test_epoch(
+            epoch, test_dataloader, net, criterion, accelerator, logger, writer
+        )
         lr_scheduler.step()
 
         if accelerator.is_main_process:
             is_best = loss < best_loss
             best_loss = min(loss, best_loss)
-            
+
             save_checkpoint(
                 {
                     "epoch": epoch,
@@ -452,8 +490,7 @@ def main():
                 save_path,
                 filename="checkpoint.pth.tar",
             )
-            
-            # Save EMA
+
             torch.save(
                 {"state_dict": ema_model.module.state_dict(), "epoch": epoch},
                 os.path.join(save_path, "checkpoint_ema.pth.tar"),
@@ -461,6 +498,7 @@ def main():
 
     if writer:
         writer.close()
+
 
 if __name__ == "__main__":
     main()
