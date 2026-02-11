@@ -137,6 +137,7 @@ def main():
     with torch.no_grad():
         # Using 'ste' mimics the rounding during compression
         out = model(x, training_mode="ste")
+        print(out)
         
         # Get raw reconstruction
         x_hat_padded = out["x_hat"]
