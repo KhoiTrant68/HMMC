@@ -3,15 +3,12 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
-import matplotlib
-# Set backend to 'Agg' before importing pyplot to avoid display errors on headless servers
-matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from PIL import Image
 from torchvision import transforms
 
-# Ensure this import path matches your project structure
+# Import your model
 from model.hmmc import HMMC
 
 def parse_args():
@@ -99,8 +96,7 @@ def main():
     # Attempt to infer N/M from checkpoint if possible, else default
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     
-    # NOTE: Ensure N and M match your training configuration
-    model = HMMC(N=192, M=320) 
+    model = HMMC(N=192, M=320) # Adjust M/N if your config differs
     model.load_state_dict(state_dict)
     model.to(args.device)
     model.eval()
@@ -113,7 +109,7 @@ def main():
     with torch.no_grad():
         out = model(x, training_mode="ste") # Use 'ste' to get discrete codes if needed, or 'noise'
         x_hat = out["x_hat"]
-        router_logits = out.get("router_logits", None)
+        router_logits = out["router_logits"] 
         # router_logits structure: Tuple of (logits, indices)
         # indices shape: [B, H, W, K]
 
@@ -125,25 +121,28 @@ def main():
     num_layers = len(router_logits)
     print(f"Found {num_layers} MoE layers.")
     
-    # Prepare Plot Layout
+    # Prepare Plot
+    # Row 1: Original | Reconstruction
+    # Row 2+: MoE Maps
+    
     cols = 4 
     rows = (num_layers // cols) + 2
     
     fig = plt.figure(figsize=(20, 5 * rows))
     
-    # Plot 1: Original
+    # Original
     ax = fig.add_subplot(rows, cols, 1)
     ax.imshow(x.squeeze().permute(1, 2, 0).cpu().numpy())
     ax.set_title("Original Input")
     ax.axis('off')
 
-    # Plot 2: Reconstruction
+    # Reconstruction
     ax = fig.add_subplot(rows, cols, 2)
     ax.imshow(x_hat.squeeze().permute(1, 2, 0).cpu().clamp(0, 1).numpy())
     ax.set_title(f"Reconstruction\nBPP Loss: {out.get('bpp_loss', 0):.4f}")
     ax.axis('off')
     
-    # Plot 3: Legend
+    # Legend
     ax = fig.add_subplot(rows, cols, 3)
     cmap = get_expert_colormap(4)
     patches = [plt.Rectangle((0,0),1,1, color=cmap(i)) for i in range(4)]
@@ -182,13 +181,10 @@ def main():
 
     plt.tight_layout()
     
-    # Construct filename and SAVE
-    filename = f"moe_vis_{os.path.basename(args.image)}"
-    save_path = os.path.join(args.save_dir, filename)
-    
-    print(f"Saving visualization to: {save_path}")
-    plt.savefig(save_path, bbox_inches='tight')
-    plt.close(fig) # Explicitly close the figure to free memory
+    save_path = os.path.join(args.save_dir, f"moe_vis_{os.path.basename(args.image)}")
+    plt.savefig(save_path)
+    print(f"Visualization saved to: {save_path}")
+    plt.close()
 
 if __name__ == "__main__":
     main()
