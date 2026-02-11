@@ -2,19 +2,19 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import trunc_normal_
+import numpy as np
+from timm.models.layers import trunc_normal_, DropPath
+from einops import rearrange
 
 from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 from compressai.models.utils import update_registered_buffers
 
-# Assumed external modules
 from modules.conv_module import (
     ConvBottleneckBlockWithStride,
     ConvBottleneckBlockWithUpsample,
 )
-# Assuming SS2D is available from your Code 2 environment
 from modules.VSS_module import SS2D 
 
 
@@ -53,12 +53,8 @@ class Scale(nn.Module):
         self.scale = nn.Parameter(init_value * torch.ones(dim), requires_grad=trainable)
 
     def forward(self, x):
-        # Automatically handle NCHW vs NHWC broadcasting
         if x.dim() == 4 and x.shape[1] == self.scale.shape[0]:
-             # NCHW: (B, C, H, W) * (C) -> reshape scale to (1, C, 1, 1)
              return x * self.scale.view(1, -1, 1, 1)
-        
-        # Standard broadcasting (NHWC or others)
         return x * self.scale
 
 # ==========================================
@@ -131,62 +127,120 @@ class MambaBlockSequence(nn.Module):
         return x
 
 # ==========================================
-# PART 3: ADVANCED ENTROPY BLOCKS
+# PART 3: ATTENTION BLOCKS 
 # ==========================================
 
-class NAFBlock(nn.Module):
-    def __init__(self, dim, inter_dim=None):
-        super().__init__()
-        self.dim = inter_dim if inter_dim is not None else dim
-        dw_channel = self.dim * 2
-        ffn_channel = self.dim * 2
+class WMSA(nn.Module):
+    """ Window Multi-head Self-attention """
+    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
+        super(WMSA, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.head_dim = head_dim 
+        self.scale = self.head_dim ** -0.5
+        self.n_heads = input_dim // head_dim
+        self.window_size = window_size
+        self.type = type
+        self.embedding_layer = nn.Linear(self.input_dim, 3 * self.input_dim, bias=True)
+        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1) * (2 * window_size - 1), self.n_heads))
+        self.linear = nn.Linear(self.input_dim, self.output_dim)
+        trunc_normal_(self.relative_position_params, std=.02)
+        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
 
-        self.dwconv = nn.Sequential(
-            nn.Conv2d(self.dim, dw_channel, 1),
-            nn.Conv2d(dw_channel, dw_channel, 3, 1, padding=1, groups=dw_channel),
-        )
-        self.sca = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel // 2, dw_channel // 2, 1)
-        )
-        self.FFN = nn.Sequential(
-            nn.Conv2d(self.dim, ffn_channel, 1),
-            SimpleGate(),
-            nn.Conv2d(ffn_channel // 2, self.dim, 1),
-        )
-        self.norm1 = LayerNorm2d(self.dim)
-        self.norm2 = LayerNorm2d(self.dim)
-        self.conv1 = nn.Conv2d(dw_channel // 2, self.dim, 1)
+    def generate_mask(self, h, w, p, shift):
+        attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        if self.type == 'W': return attn_mask
+        s = p - shift
+        attn_mask[-1, :, :s, :, s:, :] = True
+        attn_mask[-1, :, s:, :, :s, :] = True
+        attn_mask[:, -1, :, :s, :, s:] = True
+        attn_mask[:, -1, :, s:, :, :s] = True
+        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        return attn_mask
 
-        self.beta = nn.Parameter(torch.zeros((1, self.dim, 1, 1)), requires_grad=True)
-        self.gamma = nn.Parameter(torch.zeros((1, self.dim, 1, 1)), requires_grad=True)
-
-        self.in_conv = (
-            nn.Conv2d(dim, inter_dim, 1) if inter_dim is not None else nn.Identity()
-        )
-        self.out_conv = (
-            nn.Conv2d(inter_dim, dim, 1) if inter_dim is not None else nn.Identity()
-        )
+    def relative_embedding(self):
+        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
+        return self.relative_position_params[:, relation[:,:,0].long(), relation[:,:,1].long()]
 
     def forward(self, x):
-        x_in = self.in_conv(x)
-        identity = x_in
-        x = self.norm1(x_in)
+        # x: B H W C
+        if self.type != 'W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
+        
+        _, H, W, _ = x.shape
+        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_b = (self.window_size - H % self.window_size) % self.window_size
+        if pad_r > 0 or pad_b > 0:
+            x = x.permute(0, 3, 1, 2) # BHWC -> BCHW
+            x = F.pad(x, (0, pad_r, 0, pad_b))
+            x = x.permute(0, 2, 3, 1) # BCHW -> BHWC
 
-        x_dw = self.dwconv(x)
-        x1, x2 = x_dw.chunk(2, dim=1)
-        x = x1 * x2
+        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
+        h_windows = x.size(1)
+        w_windows = x.size(2)
+        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+        
+        qkv = self.embedding_layer(x)
+        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
+        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
+        sim = sim + rearrange(self.relative_embedding().to(sim.device), 'h p q -> h 1 1 p q')
+        
+        if self.type != 'W':
+            attn_mask = self.generate_mask(h_windows, w_windows, self.window_size, shift=self.window_size//2)
+            sim = sim.masked_fill_(attn_mask, float("-inf"))
 
-        x = x * self.sca(x)
-        x = self.conv1(x)
-        out = identity + x * self.beta
+        probs = F.softmax(sim, dim=-1)
+        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
+        output = rearrange(output, 'h b w p c -> b w p (h c)')
+        output = self.linear(output)
+        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
 
-        identity = out
-        out = self.norm2(out)
-        out = self.FFN(out)
-        out = identity + out * self.gamma
+        if pad_r > 0 or pad_b > 0:
+            output = output[:, :H, :W, :]
 
-        out = self.out_conv(out)
-        return out
+        if self.type != 'W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
+        return output
+
+class SwinBlock(nn.Module):
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path) -> None:
+        super().__init__()
+        self.block_1 = WMSA(input_dim, input_dim, head_dim, window_size, type='W')
+        self.block_2 = WMSA(input_dim, output_dim, head_dim, window_size, type='SW')
+        self.ln1 = nn.LayerNorm(input_dim)
+        self.ln2 = nn.LayerNorm(input_dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        # x is (B, C, H, W) -> permute for Transformer
+        x = x.permute(0, 2, 3, 1)
+        x = x + self.drop_path(self.block_1(self.ln1(x)))
+        x = x + self.drop_path(self.block_2(self.ln2(x)))
+        return x.permute(0, 3, 1, 2)
+
+class SWAtten(nn.Module):
+    """
+    Drop-in replacement for NAFBlock.
+    Combines Convolution with Swin Window Attention.
+    """
+    def __init__(self, input_dim, output_dim=None, head_dim=32, window_size=8, drop_path=0., inter_dim=192):
+        super().__init__()
+        if output_dim is None: output_dim = input_dim
+        
+        self.in_conv = nn.Conv2d(input_dim, inter_dim, 1)
+        self.swin = SwinBlock(inter_dim, inter_dim, head_dim, window_size, drop_path)
+        self.out_conv = nn.Conv2d(inter_dim, output_dim, 1)
+        self.shortcut = nn.Identity() if input_dim == output_dim else nn.Conv2d(input_dim, output_dim, 1)
+
+    def forward(self, x):
+        res = self.shortcut(x)
+        x = self.in_conv(x)
+        x = self.swin(x)
+        x = self.out_conv(x)
+        return x + res
+
+# ==========================================
+# PART 4: SPECTRAL MOE & WAVELETS
+# ==========================================
 
 class LiftingBlock(nn.Module):
     def __init__(self, in_channels):
@@ -331,7 +385,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.k_high = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
         self.v_all = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
 
-        # Utils - UPDATED: Use LayerNorm2d for NCHW flow
+        # Utils
         self.msa = MultiScaleAggregation(c_block)
         self.ln_scale = LayerNorm2d(c_block) 
         self.res_scale_1 = Scale(c_block, init_value=1.0)
@@ -414,10 +468,6 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
             out = out + shortcut
         return out
 
-# ==========================================
-# PART 4: CHECKERBOARD LOGIC
-# ==========================================
-
 class CheckerboardSplitter(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
@@ -437,7 +487,7 @@ class CheckerboardMerger(nn.Module):
         return x.reshape(B, C, H_half * 2, W_half * 2)
 
 # ==========================================
-# PART 5: INTEGRATED MODEL
+# PART 5: INTEGRATED MODEL 
 # ==========================================
 
 class HMMC(CompressionModel):
@@ -527,7 +577,11 @@ class HMMC(CompressionModel):
                 )
             )
             support_dim = M + (M * 2) + cum_channels
-            self.context_transforms.append(NAFBlock(support_dim, inter_dim=128))
+            
+            self.context_transforms.append(
+                SWAtten(input_dim=support_dim, output_dim=support_dim, 
+                        inter_dim=192, window_size=8)
+            )
 
             self.mean_transforms.append(
                 nn.Sequential(
@@ -564,7 +618,13 @@ class HMMC(CompressionModel):
             num_experts=4,
         )
         support_dim_anc = M + (M * 2) + cum_channels
-        self.naf_anchor = NAFBlock(support_dim_anc, inter_dim=128)
+        
+        # --- Mamba Scan for Anchor Context ---
+        self.anchor_mamba = MambaBlock(support_dim_anc, d_state=16)
+        
+        # --- SWAtten for Anchor ---
+        self.naf_anchor = SWAtten(input_dim=support_dim_anc, output_dim=support_dim_anc, 
+                                  inter_dim=192, window_size=8)
 
         self.mean_anchor = nn.Sequential(
             nn.Conv2d(support_dim_anc, 224, 3, 1, 1),
@@ -591,7 +651,14 @@ class HMMC(CompressionModel):
             num_experts=4,
         )
         support_dim_na = M + fusion_input_dim
-        self.naf_non_anchor = NAFBlock(support_dim_na, inter_dim=128)
+        
+        # --- Mamba Scan for Non-Anchor Context ---
+        self.non_anchor_mamba = MambaBlock(support_dim_na, d_state=16)
+
+        # --- SWAtten for Non-Anchor ---
+        self.naf_non_anchor = SWAtten(input_dim=support_dim_na, output_dim=support_dim_na, 
+                                      inter_dim=192, window_size=8)
+        
         out_na_dim = self.last_slice_dim * 3
 
         self.mean_non_anchor = nn.Sequential(
@@ -695,6 +762,9 @@ class HMMC(CompressionModel):
             ))
         
         support_anc = torch.cat([dict_info_anc, query_anc], dim=1)
+        
+        # --- Apply Mamba Context Scan ---
+        support_anc = self.anchor_mamba(support_anc)
         feat_anc = self.naf_anchor(support_anc)
         mu_anc = self.mean_anchor(feat_anc)
         scale_anc = self.scale_anchor(feat_anc)
@@ -718,7 +788,11 @@ class HMMC(CompressionModel):
             ))
 
         support_na = torch.cat([dict_info_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
+        
+        # --- Mamba Context Scan ---
+        support_na = self.non_anchor_mamba(support_na)
+
+        feat_na = self.naf_non_anchor(support_na) 
         mu_na = self.mean_non_anchor(feat_na)
         scale_na = self.scale_non_anchor(feat_na)
         _, y_lik_na = self.gaussian_conditional(y_non_anchor, scale_na, mu_na)
@@ -810,6 +884,10 @@ class HMMC(CompressionModel):
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_anc = self.moe_anchor(query_anc)
         support_anc = torch.cat([dict_anc, query_anc], dim=1)
+        
+        # --- Mamba Scan ---
+        support_anc = self.anchor_mamba(support_anc)
+        
         feat_anc = self.naf_anchor(support_anc)
         mu_anc = self.mean_anchor(feat_anc)
         scale_anc = self.scale_anchor(feat_anc)
@@ -827,6 +905,10 @@ class HMMC(CompressionModel):
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_na = self.moe_non_anchor(query_na)
         support_na = torch.cat([dict_na, query_na], dim=1)
+        
+        # --- Mamba Scan ---
+        support_na = self.non_anchor_mamba(support_na)
+        
         feat_na = self.naf_non_anchor(support_na)
         mu_na = self.mean_non_anchor(feat_na)
         scale_na = self.scale_non_anchor(feat_na)
@@ -899,6 +981,10 @@ class HMMC(CompressionModel):
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_anc = self.moe_anchor(query_anc)
         support_anc = torch.cat([dict_anc, query_anc], dim=1)
+        
+        # --- Mamba Scan ---
+        support_anc = self.anchor_mamba(support_anc)
+        
         feat_anc = self.naf_anchor(support_anc)
         mu_anc = self.mean_anchor(feat_anc)
         scale_anc = self.scale_anchor(feat_anc)
@@ -919,6 +1005,9 @@ class HMMC(CompressionModel):
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_na = self.moe_non_anchor(query_na)
         support_na = torch.cat([dict_na, query_na], dim=1)
+        
+        # --- Mamba Scan ---
+        support_na = self.non_anchor_mamba(support_na)
         feat_na = self.naf_non_anchor(support_na)
         mu_na = self.mean_non_anchor(feat_na)
         scale_na = self.scale_non_anchor(feat_na)
