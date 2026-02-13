@@ -9,14 +9,12 @@ from compressai.entropy_models import EntropyBottleneck, GaussianConditional
 from compressai.models import CompressionModel
 from compressai.models.utils import update_registered_buffers
 
-# Assumed external modules
 from modules.conv_module import (
     ConvBottleneckBlockWithStride,
     ConvBottleneckBlockWithUpsample,
 )
-# Assuming SS2D is available from your Code 2 environment
 from modules.VSS_module import SS2D 
-
+from modules.layers import WindowAttention, FlashGMMConditional
 
 # ==========================================
 # PART 1: HELPER FUNCTIONS & BLOCKS
@@ -187,6 +185,23 @@ class NAFBlock(nn.Module):
 
         out = self.out_conv(out)
         return out
+    
+class HybridContextBlock(nn.Module):
+    """
+    Context Block
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.naf = NAFBlock(dim, inter_dim=dim)
+        self.wla = WindowAttention(dim)
+        self.fusion = nn.Conv2d(dim * 2, dim, 1)
+        self.norm = LayerNorm2d(dim)
+    
+    def forward(self, x):
+        x_conv = self.naf(x)
+        x_attn = self.wla(x)
+        out = self.fusion(torch.cat([x_conv, x_attn], dim=1))
+        return self.norm(out)
 
 class LiftingBlock(nn.Module):
     def __init__(self, in_channels):
@@ -331,7 +346,6 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.k_high = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
         self.v_all = nn.Linear(self.dim_high, self.dim_high, bias=qkv_bias)
 
-        # Utils - UPDATED: Use LayerNorm2d for NCHW flow
         self.msa = MultiScaleAggregation(c_block)
         self.ln_scale = LayerNorm2d(c_block) 
         self.res_scale_1 = Scale(c_block, init_value=1.0)
@@ -402,11 +416,9 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         hf_processed = hf_processed.permute(0, 3, 1, 2)
         recon = self.idwt(ll_processed, hf_processed)
 
-        # Utils (Flow is NCHW)
         recon = recon + self.res_scale_1(self.msa(self.ln_scale(recon)))
         recon = recon + self.res_scale_2(self.mlp(self.ln_mlp(recon))) 
         
-        # Output Linear expects NHWC
         out = self.output_trans(recon.permute(0, 2, 3, 1)) 
         out = out.permute(0, 3, 1, 2)
         
@@ -445,10 +457,12 @@ class HMMC(CompressionModel):
         self,
         N=192,
         M=320,
+        num_mixtures=3
     ):
         super().__init__()
         self.N = N
         self.M = M
+        self.num_mixtures = num_mixtures
 
         self.groups = [0, 16, 16, 32, 64, 192]
         self.num_standard_slices = len(self.groups) - 2
@@ -504,10 +518,11 @@ class HMMC(CompressionModel):
         )
 
         # ENTROPY
+        self.entropy_bottleneck = EntropyBottleneck(192)
+        self.gmm_conditional = FlashGMMConditional(num_mixtures=num_mixtures)
         self.dt_cross_attention = nn.ModuleList()
         self.context_transforms = nn.ModuleList()
-        self.mean_transforms = nn.ModuleList()
-        self.scale_transforms = nn.ModuleList()
+        self.entropy_params = nn.ModuleList()   
         self.lrp_transforms = nn.ModuleList()
 
         cum_channels = 0
@@ -527,20 +542,13 @@ class HMMC(CompressionModel):
                 )
             )
             support_dim = M + (M * 2) + cum_channels
-            self.context_transforms.append(NAFBlock(support_dim, inter_dim=128))
+            self.context_transforms.append(HybridContextBlock(support_dim))
 
-            self.mean_transforms.append(
+            self.entropy_params.append(
                 nn.Sequential(
                     nn.Conv2d(support_dim, 224, 3, 1, 1),
                     nn.GELU(),
-                    nn.Conv2d(224, current_dim, 3, 1, 1),
-                )
-            )
-            self.scale_transforms.append(
-                nn.Sequential(
-                    nn.Conv2d(support_dim, 224, 3, 1, 1),
-                    nn.GELU(),
-                    nn.Conv2d(224, current_dim, 3, 1, 1),
+                    nn.Conv2d(224, current_dim * num_mixtures * 3, 3, 1, 1),
                 )
             )
             self.lrp_transforms.append(
@@ -564,17 +572,12 @@ class HMMC(CompressionModel):
             num_experts=4,
         )
         support_dim_anc = M + (M * 2) + cum_channels
-        self.naf_anchor = NAFBlock(support_dim_anc, inter_dim=128)
+        self.ctx_anchor = HybridContextBlock(support_dim_anc)
 
-        self.mean_anchor = nn.Sequential(
+        self.head_anchor = nn.Sequential(
             nn.Conv2d(support_dim_anc, 224, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(224, self.last_slice_dim, 3, 1, 1),
-        )
-        self.scale_anchor = nn.Sequential(
-            nn.Conv2d(support_dim_anc, 224, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(224, self.last_slice_dim, 3, 1, 1),
+            nn.Conv2d(224, self.last_slice_dim * num_mixtures * 3, 3, 1, 1),
         )
         self.lrp_anchor = nn.Sequential(
             nn.Conv2d(support_dim_anc + self.last_slice_dim, 224, 3, 1, 1),
@@ -591,34 +594,45 @@ class HMMC(CompressionModel):
             num_experts=4,
         )
         support_dim_na = M + fusion_input_dim
-        self.naf_non_anchor = NAFBlock(support_dim_na, inter_dim=128)
-        out_na_dim = self.last_slice_dim * 3
+        self.ctx_non_anchor = HybridContextBlock(support_dim_na)
+        out_non_anchor_dim = self.last_slice_dim * 3
 
-        self.mean_non_anchor = nn.Sequential(
+        self.head_non_anchor = nn.Sequential(
             nn.Conv2d(support_dim_na, 224, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(224, out_na_dim, 3, 1, 1),
-        )
-        self.scale_non_anchor = nn.Sequential(
-            nn.Conv2d(support_dim_na, 224, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(224, out_na_dim, 3, 1, 1),
+            nn.Conv2d(224, out_non_anchor_dim * num_mixtures * 3, 3, 1, 1),
         )
         self.lrp_non_anchor = nn.Sequential(
-            nn.Conv2d(support_dim_na + out_na_dim, 224, 3, 1, 1),
+            nn.Conv2d(support_dim_na + out_non_anchor_dim, 224, 3, 1, 1),
             nn.GELU(),
-            nn.Conv2d(224, out_na_dim, 3, 1, 1),
+            nn.Conv2d(224, out_non_anchor_dim, 3, 1, 1),
         )
 
-        self.entropy_bottleneck = EntropyBottleneck(192)
-        self.gaussian_conditional = GaussianConditional(None)
 
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = get_scale_table()
-        updated = self.gaussian_conditional.update_scale_table(scale_table, force=force)
-        updated |= super().update(force=force)
+        updated = self.entropy_bottleneck.update(force=force)
         return updated
+    
+    def _parse_gmm_params(self, params, channels):
+        """
+        Splits (B, C*K*3, H, W) -> weights, means, scales for FlashGMM.
+        """
+        B, _, H, W = params.shape
+        params = params.view(B, channels, self.num_mixtures, 3, H, W)
+        
+        # Softmax over mixtures for weights
+        weights = F.softmax(params[:, :, :, 0, :, :], dim=2) 
+        means = params[:, :, :, 1, :, :]
+        # Softplus for scales (variance must be positive)
+        scales = F.softplus(params[:, :, :, 2, :, :]) + 1e-6 
+        
+        # Reshape for FlashGMM: (B, K, C, H, W)
+        weights = weights.permute(0, 2, 1, 3, 4)
+        means = means.permute(0, 2, 1, 3, 4)
+        scales = scales.permute(0, 2, 1, 3, 4)
+        return weights, means, scales
 
     def forward(self, x, training_mode="noise"):
         y = self.g_a(x)
@@ -637,6 +651,7 @@ class HMMC(CompressionModel):
         y_hat_slices = []
         y_likelihood = []
         all_logits = []
+        cca_info = []
 
         # A. Standard Slices
         for i in range(self.num_standard_slices):
@@ -656,20 +671,24 @@ class HMMC(CompressionModel):
 
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
-            mu = self.mean_transforms[i](support_feat)
-            scale = self.scale_transforms[i](support_feat)
+            params = self.entropy_params[i](support_feat)
+            params = params[:, :, : y_shape[0], : y_shape[1]]
 
-            mu = mu[:, :, : y_shape[0], : y_shape[1]]
-            scale = scale[:, :, : y_shape[0], : y_shape[1]]
+            w, mu, sigma = self._parse_gmm_params(params, self.groups[i+1])
 
-            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
+            y_slice_likelihood = self.gmm_conditional(y_slice, w, mu, sigma)
             y_likelihood.append(y_slice_likelihood)
+
+            mu_aggr = torch.sum(w * mu, dim=1) 
+
 
             if self.training and training_mode == "noise":
                 noise = torch.empty_like(y_slice).uniform_(-0.5, 0.5)
                 y_hat_slice = y_slice + noise
             else:
-                y_hat_slice = ste_round(y_slice - mu) + mu
+                y_hat_slice = ste_round(y_slice - mu_aggr) + mu_aggr
+            
+            cca_info.append((mu_aggr, y_hat_slice))
 
             lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[i](lrp_in)
@@ -695,16 +714,18 @@ class HMMC(CompressionModel):
             ))
         
         support_anc = torch.cat([dict_info_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
-        mu_anc = self.mean_anchor(feat_anc)
-        scale_anc = self.scale_anchor(feat_anc)
-        _, y_lik_anc = self.gaussian_conditional(y_anchor, scale_anc, mu_anc)
+        feat_anc = self.ctx_anchor(support_anc)
+        params_anc = self.head_anchor(feat_anc)
+        w_anc, mu_anc, sigma_anc = self._parse_gmm_params(params_anc, self.last_slice_dim)
+        y_lik_anc = self.gmm_conditional(y_anchor, w_anc, mu_anc, sigma_anc)
+        mu_aggr_anc = torch.sum(w_anc * mu_anc, dim=1)
 
         if self.training and training_mode == "noise":
             y_hat_anc = y_anchor + torch.empty_like(y_anchor).uniform_(-0.5, 0.5)
         else:
-            y_hat_anc = ste_round(y_anchor - mu_anc) + mu_anc
-
+            y_hat_anc = ste_round(y_anchor - mu_aggr_anc) + mu_aggr_anc
+        
+        cca_info.append((mu_aggr_anc, y_hat_anc))
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
@@ -718,16 +739,19 @@ class HMMC(CompressionModel):
             ))
 
         support_na = torch.cat([dict_info_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
-        mu_na = self.mean_non_anchor(feat_na)
-        scale_na = self.scale_non_anchor(feat_na)
-        _, y_lik_na = self.gaussian_conditional(y_non_anchor, scale_na, mu_na)
+        feat_na = self.ctx_na(support_na)
+        params_na = self.head_na(feat_na)
+        w_na, mu_na, sigma_na = self._parse_gmm_params(params_na, self.last_slice_dim * 3)
+        y_lik_na = self.gmm_conditional(y_non_anchor, w_na, mu_na, sigma_na)
+        
+        mu_aggr_na = torch.sum(w_na * mu_na, dim=1)
 
         if self.training and training_mode == "noise":
             y_hat_na = y_non_anchor + torch.empty_like(y_non_anchor).uniform_(-0.5, 0.5)
         else:
-            y_hat_na = ste_round(y_non_anchor - mu_na) + mu_na
+            y_hat_na = ste_round(y_non_anchor - mu_aggr_na) + mu_aggr_na
 
+        cca_info.append((mu_aggr_na, y_hat_na))
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
@@ -747,31 +771,28 @@ class HMMC(CompressionModel):
             "x_hat": x_hat,
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
             "router_logits": tuple(all_logits) if all_logits else None,
+            "cca_info": cca_info
         }
 
     def compress(self, x):
         y = self.g_a(x)
         y_shape = y.shape[2:]
+        
+        # 1. Compress Hyper-Prior
         z = self.h_a(y)
         z_strings = self.entropy_bottleneck.compress(z)
         z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
+        # 2. Context Initialization
         latent_scales = self.h_z_s1(z_hat)
         latent_means = self.h_z_s2(z_hat)
         hyper_info = torch.cat([latent_means, latent_scales], dim=1)
 
         y_slices = y.split(self.groups[1:], 1)
         y_hat_slices = []
+        y_strings = []
 
-        cdf = self.gaussian_conditional.quantized_cdf.tolist()
-        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
-        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
-
-        encoder = BufferedRansEncoder()
-        all_symbols = []
-        all_indexes = []
-
-        # A. Standard
+        # A. Standard Slices
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
             if i == 0:
@@ -780,20 +801,21 @@ class HMMC(CompressionModel):
                 prev_slices = torch.cat(y_hat_slices, dim=1)
                 query = torch.cat([hyper_info, prev_slices], dim=1)
 
+            # Context & Param Prediction
             dict_info = self.dt_cross_attention[i](query)
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
-            mu = self.mean_transforms[i](support_feat)
-            scale = self.scale_transforms[i](support_feat)
+            params = self.entropy_params[i](support_feat)
+            params = params[:, :, : y_shape[0], : y_shape[1]]
+            
+            w, mu, sigma = self._parse_gmm_params(params, self.groups[i+1])
+            
+            slice_str = self.gmm_conditional.compress(y_slice, w, mu, sigma)
+            y_strings.append(slice_str)
 
-            mu = mu[:, :, : y_shape[0], : y_shape[1]]
-            scale = scale[:, :, : y_shape[0], : y_shape[1]]
-            index = self.gaussian_conditional.build_indexes(scale)
-            y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
-            y_hat_slice = y_q_slice + mu
-
-            all_symbols.append(y_q_slice.reshape(-1))
-            all_indexes.append(index.reshape(-1))
+            mu_aggr = torch.sum(w * mu, dim=1)
+            y_q_slice = ste_round(y_slice - mu_aggr)
+            y_hat_slice = y_q_slice + mu_aggr
 
             lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[i](lrp_in)
@@ -802,66 +824,67 @@ class HMMC(CompressionModel):
 
         # B. Checkerboard
         last_slice = y_slices[-1]
-        y_anc, y_na = self.checkerboard_split(last_slice)
-        prev_slices_down = F.avg_pool2d(torch.cat(y_hat_slices, dim=1), 2)
+        y_anchor, y_non_anchor = self.checkerboard_split(last_slice)
+        
+        prev_slices_full = torch.cat(y_hat_slices, dim=1)
+        prev_slices_down = F.avg_pool2d(prev_slices_full, 2)
         hyper_down = F.avg_pool2d(hyper_info, 2)
 
-        # Anchor
+        # Anchor Slice
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_anc = self.moe_anchor(query_anc)
         support_anc = torch.cat([dict_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
-        mu_anc = self.mean_anchor(feat_anc)
-        scale_anc = self.scale_anchor(feat_anc)
-
-        index_anc = self.gaussian_conditional.build_indexes(scale_anc)
-        y_q_anc = self.gaussian_conditional.quantize(y_anc, "symbols", mu_anc)
-        y_hat_anc = y_q_anc + mu_anc
-        all_symbols.append(y_q_anc.reshape(-1))
-        all_indexes.append(index_anc.reshape(-1))
-
+        
+        feat_anc = self.ctx_anchor(support_anc)
+        params_anc = self.head_anchor(feat_anc)
+        w_anc, mu_anc, sigma_anc = self._parse_gmm_params(params_anc, self.last_slice_dim)
+        
+        # Compress Anchor
+        anc_str = self.gmm_conditional.compress(y_anchor, w_anc, mu_anc, sigma_anc)
+        y_strings.append(anc_str)
+        
+        # Reconstruct Anchor
+        mu_aggr_anc = torch.sum(w_anc * mu_anc, dim=1)
+        y_hat_anc = ste_round(y_anchor - mu_aggr_anc) + mu_aggr_anc
+        
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        # Non-Anchor
+        # Non-Anchor Slice
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_na = self.moe_non_anchor(query_na)
         support_na = torch.cat([dict_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
-        mu_na = self.mean_non_anchor(feat_na)
-        scale_na = self.scale_non_anchor(feat_na)
+        
+        feat_na = self.ctx_non_anchor(support_na)
+        params_na = self.head_non_anchor(feat_na)
+        w_na, mu_na, sigma_na = self._parse_gmm_params(params_na, self.last_slice_dim * 3)
+        
+        # Compress Non-Anchor
+        na_str = self.gmm_conditional.compress(y_non_anchor, w_na, mu_na, sigma_na)
+        y_strings.append(na_str)
+        
+        # Reconstruct Non-Anchor (Not strictly needed for return, but for consistency)
+        # mu_aggr_na = torch.sum(w_na * mu_na, dim=1)
+        # y_hat_na = ste_round(y_non_anchor - mu_aggr_na) + mu_aggr_na
 
-        index_na = self.gaussian_conditional.build_indexes(scale_na)
-        y_q_na = self.gaussian_conditional.quantize(y_na, "symbols", mu_na)
-        all_symbols.append(y_q_na.reshape(-1))
-        all_indexes.append(index_na.reshape(-1))
-
-        encoder.encode_with_indexes(
-            torch.cat(all_symbols).tolist(),
-            torch.cat(all_indexes).tolist(),
-            cdf,
-            cdf_lengths,
-            offsets,
-        )
-        y_string = encoder.flush()
-        return {"strings": [[y_string], z_strings], "shape": z.size()[-2:]}
+        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
 
     def decompress(self, strings, shape):
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        y_strings = strings[0]
+        z_strings = strings[1]
+        
+        # 1. Decompress Hyper-Prior
+        z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
         latent_scales = self.h_z_s1(z_hat)
         latent_means = self.h_z_s2(z_hat)
         hyper_info = torch.cat([latent_means, latent_scales], dim=1)
-        y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
-
-        cdf = self.gaussian_conditional.quantized_cdf.tolist()
-        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
-        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
-
-        decoder = RansDecoder()
-        decoder.set_stream(strings[0][0])
+        
+        y_shape_H = z_hat.shape[2] * 4
+        y_shape_W = z_hat.shape[3] * 4
         y_hat_slices = []
+        str_idx = 0 
 
-        # A. Standard
+        # A. Standard Slices
         for i in range(self.num_standard_slices):
             if i == 0:
                 query = hyper_info
@@ -872,19 +895,13 @@ class HMMC(CompressionModel):
             dict_info = self.dt_cross_attention[i](query)
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
-            mu = self.mean_transforms[i](support_feat)
-            scale = self.scale_transforms[i](support_feat)
-            mu = mu[:, :, : y_shape[0], : y_shape[1]]
-            scale = scale[:, :, : y_shape[0], : y_shape[1]]
-            index = self.gaussian_conditional.build_indexes(scale)
-
-            rv = decoder.decode_stream(
-                index.reshape(-1).tolist(), cdf, cdf_lengths, offsets
-            )
-            rv = torch.tensor(rv, dtype=torch.float32, device=mu.device).reshape(
-                1, -1, y_shape[0], y_shape[1]
-            )
-            y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
+            params = self.entropy_params[i](support_feat)
+            params = params[:, :, : y_shape_H, : y_shape_W]
+            
+            w, mu, sigma = self._parse_gmm_params(params, self.groups[i+1])
+            
+            y_hat_slice = self.gmm_conditional.decompress(y_strings[str_idx], w, mu, sigma)
+            str_idx += 1
 
             lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
             lrp = self.lrp_transforms[i](lrp_in)
@@ -892,26 +909,22 @@ class HMMC(CompressionModel):
             y_hat_slices.append(y_hat_slice)
 
         # B. Checkerboard
-        prev_slices_down = F.avg_pool2d(torch.cat(y_hat_slices, dim=1), 2)
+        prev_slices_full = torch.cat(y_hat_slices, dim=1)
+        prev_slices_down = F.avg_pool2d(prev_slices_full, 2)
         hyper_down = F.avg_pool2d(hyper_info, 2)
 
         # Anchor
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
         dict_anc = self.moe_anchor(query_anc)
         support_anc = torch.cat([dict_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
-        mu_anc = self.mean_anchor(feat_anc)
-        scale_anc = self.scale_anchor(feat_anc)
-
-        index_anc = self.gaussian_conditional.build_indexes(scale_anc)
-        rv_anc = decoder.decode_stream(
-            index_anc.reshape(-1).tolist(), cdf, cdf_lengths, offsets
-        )
-        rv_anc = (
-            torch.tensor(rv_anc, dtype=torch.float32, device=mu_anc.device)
-            .reshape(1, self.last_slice_dim, y_shape[0] // 2, y_shape[1] // 2)
-        )
-        y_hat_anc = self.gaussian_conditional.dequantize(rv_anc, mu_anc)
+        
+        feat_anc = self.ctx_anchor(support_anc)
+        params_anc = self.head_anchor(feat_anc)
+        w_anc, mu_anc, sigma_anc = self._parse_gmm_params(params_anc, self.last_slice_dim)
+        
+        y_hat_anc = self.gmm_conditional.decompress(y_strings[str_idx], w_anc, mu_anc, sigma_anc)
+        str_idx += 1
+        
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
@@ -919,26 +932,22 @@ class HMMC(CompressionModel):
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
         dict_na = self.moe_non_anchor(query_na)
         support_na = torch.cat([dict_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
-        mu_na = self.mean_non_anchor(feat_na)
-        scale_na = self.scale_non_anchor(feat_na)
-
-        index_na = self.gaussian_conditional.build_indexes(scale_na)
-        rv_na = decoder.decode_stream(
-            index_na.reshape(-1).tolist(), cdf, cdf_lengths, offsets
-        )
-        rv_na = (
-            torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device)
-            .reshape(1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2)
-        )
-        y_hat_na = self.gaussian_conditional.dequantize(rv_na, mu_na)
-        lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
+        
+        feat_na = self.ctx_non_anchor(support_na)
+        params_na = self.head_non_anchor(feat_na)
+        w_na, mu_na, sigma_na = self._parse_gmm_params(params_na, self.last_slice_dim * 3)
+        
+        y_hat_na = self.gmm_conditional.decompress(y_strings[str_idx], w_na, mu_na, sigma_na)
+        str_idx += 1
+        
+        lrp_na = self.lrp_na(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
         # Merge
         y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
         y_hat_slices.append(y_hat_last)
 
+        # Recon
         y_hat = torch.cat(y_hat_slices, dim=1)
         x_hat = self.g_s(y_hat).clamp(0, 1)
         return {"x_hat": x_hat}
