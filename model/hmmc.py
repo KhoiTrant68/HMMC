@@ -739,7 +739,7 @@ class HMMC(CompressionModel):
             ))
 
         support_na = torch.cat([dict_info_na, query_na], dim=1)
-        feat_na = self.ctx_na(support_na)
+        feat_na = self.ctx_non_anchor(support_na)
         params_na = self.head_na(feat_na)
         w_na, mu_na, sigma_na = self._parse_gmm_params(params_na, self.last_slice_dim * 3)
         y_lik_na = self.gmm_conditional(y_non_anchor, w_na, mu_na, sigma_na)
