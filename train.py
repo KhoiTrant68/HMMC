@@ -90,26 +90,16 @@ class LossFreeBalancer:
                 moe_module.expert_biases.data.add_(update_step.to(device))
 
     def _get_module_by_index(self, model, index):
-        """
-        Maps the flat index from `all_logits` to the specific MoE module in HMMC.
-        Forward order in HMMC:
-        1. Standard Slices (dt_cross_attention list)
-        2. Anchor (moe_anchor)
-        3. Non-Anchor (moe_non_anchor)
-        """
-        # Safety check if attribute exists
-        if not hasattr(model, "dt_cross_attention"):
+            """
+            Maps the flat index from `all_logits` to the specific MoE module.
+            index 0: Encoder HF MoE (g_a)
+            index 1: Decoder HF MoE (g_s)
+            """
+            if hasattr(model, "get_moe_modules"):
+                moe_modules = model.get_moe_modules()
+                if index < len(moe_modules):
+                    return moe_modules[index]
             return None
-
-        num_standard = len(model.dt_cross_attention)
-
-        if index < num_standard:
-            return model.dt_cross_attention[index]
-        elif index == num_standard:
-            return model.moe_anchor
-        elif index == num_standard + 1:
-            return model.moe_non_anchor
-        return None
 
 
 # =========================================================
