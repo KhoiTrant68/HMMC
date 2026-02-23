@@ -536,7 +536,7 @@ class HMMC(CompressionModel):
                 SpectralMoEDictionaryCrossAttention(
                     input_dim=moe_input_dim,
                     output_dim=M,
-                    head_num=8,
+                    head_num=4,
                     mlp_rate=4,
                     num_experts=4,
                 )
@@ -567,7 +567,7 @@ class HMMC(CompressionModel):
         self.moe_anchor = SpectralMoEDictionaryCrossAttention(
             input_dim=(M * 2) + cum_channels,
             output_dim=M,
-            head_num=8,
+            head_num=4,
             mlp_rate=4,
             num_experts=4,
         )
@@ -589,7 +589,7 @@ class HMMC(CompressionModel):
         self.moe_non_anchor = SpectralMoEDictionaryCrossAttention(
             input_dim=fusion_input_dim,
             output_dim=M,
-            head_num=8,
+            head_num=4,
             mlp_rate=4,
             num_experts=4,
         )
