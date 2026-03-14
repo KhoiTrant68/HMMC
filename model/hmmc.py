@@ -61,7 +61,7 @@ class Scale(nn.Module):
 
 
 # ==========================================
-# PART 2: HAAR WAVELET TRANSFORMS 
+# PART 2: HAAR WAVELET TRANSFORMS
 # ==========================================
 
 
