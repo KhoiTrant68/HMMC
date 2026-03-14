@@ -1,37 +1,38 @@
 # Modified by $@#Anonymous#@$ #20240123
 # Copyright (c) 2023, Albert Gu, Tri Dao.
+import ast
+import os
+import platform
+import re
+import shutil
+import subprocess
 import sys
 import warnings
-import os
-import re
-import ast
 from pathlib import Path
-from packaging.version import parse, Version
-import platform
-import shutil
-
-from setuptools import setup, find_packages
-import subprocess
-from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 import torch
+from packaging.version import Version, parse
+from setuptools import find_packages, setup
 from torch.utils.cpp_extension import (
+    CUDA_HOME,
     BuildExtension,
     CppExtension,
     CUDAExtension,
-    CUDA_HOME,
 )
+from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FORCE_CXX11_ABI", "FALSE") == "TRUE"
 
+
 def get_compute_capability():
     device = torch.device("cuda")
     capability = torch.cuda.get_device_capability(device)
     return int(str(capability[0]) + str(capability[1]))
-    
+
+
 def get_cuda_bare_metal_version(cuda_dir):
     raw_output = subprocess.check_output(
         [cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True
@@ -42,9 +43,11 @@ def get_cuda_bare_metal_version(cuda_dir):
 
     return raw_output, bare_metal_version
 
+
 # MODES = ["oflex"]
 MODES = ["core", "oflex"]
 # MODES = ["core", "ndstate", "oflex", "nrow"]
+
 
 def get_ext():
     cc_flag = []
@@ -54,19 +57,23 @@ def get_ext():
 
     # Check if card has compute capability 8.0 or higher for BFloat16 operations
     if get_compute_capability() < 80:
-        warnings.warn("This code uses BFloat16 date type, which is only supported on GPU architectures with compute capability 8.0 or higher")
-        
+        warnings.warn(
+            "This code uses BFloat16 date type, which is only supported on GPU architectures with compute capability 8.0 or higher"
+        )
+
     multi_threads = True
     if CUDA_HOME is not None:
         _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
         print("CUDA version: ", bare_metal_version, flush=True)
         if bare_metal_version < Version("11.6"):
-            warnings.warn("CUDA version ealier than 11.6 may leads to performance mismatch.")
+            warnings.warn(
+                "CUDA version ealier than 11.6 may leads to performance mismatch."
+            )
         if bare_metal_version < Version("11.2"):
             multi_threads = False
-            
+
     cc_flag.append(f"-arch=sm_{get_compute_capability()}")
-    
+
     if multi_threads:
         cc_flag.extend(["--threads", "4"])
 
@@ -119,21 +126,21 @@ def get_ext():
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
                 "nvcc": [
-                            "-O3",
-                            "-std=c++17",
-                            "-U__CUDA_NO_HALF_OPERATORS__",
-                            "-U__CUDA_NO_HALF_CONVERSIONS__",
-                            "-U__CUDA_NO_BFLOAT16_OPERATORS__",
-                            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                            "-U__CUDA_NO_BFLOAT162_OPERATORS__",
-                            "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
-                            "--expt-relaxed-constexpr",
-                            "--expt-extended-lambda",
-                            "--use_fast_math",
-                            "--ptxas-options=-v",
-                            "-lineinfo",
-                        ]
-                        + cc_flag
+                    "-O3",
+                    "-std=c++17",
+                    "-U__CUDA_NO_HALF_OPERATORS__",
+                    "-U__CUDA_NO_HALF_CONVERSIONS__",
+                    "-U__CUDA_NO_BFLOAT16_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                    "-U__CUDA_NO_BFLOAT162_OPERATORS__",
+                    "-U__CUDA_NO_BFLOAT162_CONVERSIONS__",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "--use_fast_math",
+                    "--ptxas-options=-v",
+                    "-lineinfo",
+                ]
+                + cc_flag,
             },
             include_dirs=[Path(this_dir) / "csrc" / "selective_scan"],
         )
@@ -141,6 +148,7 @@ def get_ext():
     ]
 
     return ext_modules
+
 
 ext_modules = get_ext()
 setup(
@@ -159,7 +167,13 @@ setup(
         "Operating System :: Unix",
     ],
     ext_modules=ext_modules,
-    cmdclass={"bdist_wheel": _bdist_wheel, "build_ext": BuildExtension} if ext_modules else {"bdist_wheel": _bdist_wheel,},
+    cmdclass=(
+        {"bdist_wheel": _bdist_wheel, "build_ext": BuildExtension}
+        if ext_modules
+        else {
+            "bdist_wheel": _bdist_wheel,
+        }
+    ),
     python_requires=">=3.7",
     install_requires=[
         "torch",

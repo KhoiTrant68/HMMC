@@ -1,26 +1,45 @@
 import argparse
-import os
 import math
+import os
+
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from PIL import Image
 from torchvision import transforms
+
+from loss.loss import RateDistortionLoss
 
 # --- LOCAL MODULE IMPORTS ---
 # Ensure your folder structure has 'model/' and 'loss/' directories
 from model.hmmc import HMMC
-from loss.loss import RateDistortionLoss
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Visualize HMMC MoE Router Decisions")
-    parser.add_argument("-i", "--image", type=str, required=True, help="Path to input image")
-    parser.add_argument("-c", "--checkpoint", type=str, required=True, help="Path to model checkpoint (.pth.tar)")
-    parser.add_argument("--save_dir", type=str, default="vis_results", help="Directory to save results")
-    parser.add_argument("--alpha", type=float, default=0.5, help="Opacity of the expert overlay (0.0 to 1.0)")
+    parser.add_argument(
+        "-i", "--image", type=str, required=True, help="Path to input image"
+    )
+    parser.add_argument(
+        "-c",
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to model checkpoint (.pth.tar)",
+    )
+    parser.add_argument(
+        "--save_dir", type=str, default="vis_results", help="Directory to save results"
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.5,
+        help="Opacity of the expert overlay (0.0 to 1.0)",
+    )
     return parser.parse_args()
+
 
 def load_image(path, device):
     """
@@ -29,20 +48,21 @@ def load_image(path, device):
     """
     img = Image.open(path).convert("RGB")
     original_h, original_w = img.height, img.width
-    
+
     transform = transforms.Compose([transforms.ToTensor()])
-    x = transform(img).unsqueeze(0).to(device) # [1, 3, H, W]
-    
+    x = transform(img).unsqueeze(0).to(device)  # [1, 3, H, W]
+
     # Pad to multiple of 64 (Model requirement)
     h, w = x.shape[2:]
     p_h = (64 - (h % 64)) % 64
     p_w = (64 - (w % 64)) % 64
-    
+
     # F.pad format: (left, right, top, bottom)
     if p_h > 0 or p_w > 0:
-        x = F.pad(x, (0, p_w, 0, p_h), mode='reflect')
-        
+        x = F.pad(x, (0, p_w, 0, p_h), mode="reflect")
+
     return x, (original_h, original_w)
+
 
 def clean_state_dict(state_dict):
     """Removes 'module.' prefix usually added by DataParallel/Accelerate."""
@@ -51,6 +71,7 @@ def clean_state_dict(state_dict):
         new_key = k.replace("module.", "")
         new_state_dict[new_key] = v
     return new_state_dict
+
 
 def get_model_params_from_state_dict(state_dict):
     """
@@ -72,18 +93,20 @@ def get_model_params_from_state_dict(state_dict):
             return 192, M
     except Exception as e:
         print(f"   [Warning] Could not infer params: {e}")
-    
+
     print("   [Warning] Using default N=192, M=320.")
     return 192, 320
 
+
 def get_expert_colormap(num_experts=4):
     """Defines colors for experts: Red, Green, Blue, Yellow."""
-    colors = ['#FF0000', '#00FF00', '#0000FF', '#FFFF00']
+    colors = ["#FF0000", "#00FF00", "#0000FF", "#FFFF00"]
     # If more experts, cycle or add more
     if num_experts > 4:
-        extra_colors = ['#00FFFF', '#FF00FF', '#FFFFFF', '#000000']
-        colors.extend(extra_colors[:num_experts-4])
+        extra_colors = ["#00FFFF", "#FF00FF", "#FFFFFF", "#000000"]
+        colors.extend(extra_colors[: num_experts - 4])
     return mcolors.ListedColormap(colors[:num_experts])
+
 
 def overlay_expert_map(img_tensor, expert_indices, alpha=0.4, num_experts=4):
     """
@@ -97,34 +120,37 @@ def overlay_expert_map(img_tensor, expert_indices, alpha=0.4, num_experts=4):
 
     # Resize expert map to Image Size using Nearest Neighbor (to keep integers)
     expert_map_tensor = expert_indices.unsqueeze(0).unsqueeze(0).float()
-    expert_map_up = F.interpolate(expert_map_tensor, size=(H, W), mode='nearest')
-    expert_map_up = expert_map_up.squeeze().cpu().numpy() # [H, W]
+    expert_map_up = F.interpolate(expert_map_tensor, size=(H, W), mode="nearest")
+    expert_map_up = expert_map_up.squeeze().cpu().numpy()  # [H, W]
 
     # Create Color Map
     cmap = get_expert_colormap(num_experts)
     norm = mcolors.BoundaryNorm(np.arange(-0.5, num_experts + 0.5, 1), cmap.N)
-    
+
     # Apply colormap -> [H, W, 4] (RGBA)
     colored_map = cmap(norm(expert_map_up))
-    
+
     # Extract RGB for blending
     overlay_rgb = colored_map[..., :3]
-    
+
     # Blend: (1-alpha)*Original + alpha*Overlay
     blended = (1 - alpha) * img_np + alpha * overlay_rgb
     blended = np.clip(blended, 0, 1)
-    
+
     return blended, expert_map_up
+
 
 def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
-    
+
     # 1. Device Setup
     if torch.cuda.is_available():
         device = "cuda"
     else:
-        print("WARNING: CUDA not found. HMMC uses Mamba/Triton kernels which usually fail on CPU.")
+        print(
+            "WARNING: CUDA not found. HMMC uses Mamba/Triton kernels which usually fail on CPU."
+        )
         device = "cpu"
     print(f"1. Device set to: {device}")
 
@@ -137,16 +163,18 @@ def main():
     # 3. Model Init
     N, M = get_model_params_from_state_dict(state_dict)
     model = HMMC(N=N, M=M)
-    
+
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as e:
-        print(f"   [Warning] Strict loading failed. Retrying with strict=False.\n   Error: {e}")
+        print(
+            f"   [Warning] Strict loading failed. Retrying with strict=False.\n   Error: {e}"
+        )
         model.load_state_dict(state_dict, strict=False)
 
     model.to(device)
     model.eval()
-    
+
     # Important: Update scale tables for entropy model
     model.update(force=True)
 
@@ -155,18 +183,20 @@ def main():
 
     # 5. Load Image
     x_padded, (orig_h, orig_w) = load_image(args.image, device)
-    print(f"3. Image loaded. Original: {orig_h}x{orig_w}, Padded: {x_padded.shape[2]}x{x_padded.shape[3]}")
+    print(
+        f"3. Image loaded. Original: {orig_h}x{orig_w}, Padded: {x_padded.shape[2]}x{x_padded.shape[3]}"
+    )
 
     # 6. Inference & Loss Calculation
     print("4. Running inference...")
     with torch.no_grad():
         # Use 'ste' (Straight-Through Estimator) to simulate quantization rounding
         out = model(x_padded, training_mode="ste")
-        
+
         # --- CALCULATE LOSS ---
         # This populates 'bpp_loss', 'mse_loss', 'psnr'
         out_metrics = criterion(out, x_padded)
-        
+
         bpp_val = out_metrics["bpp_loss"].item()
         psnr_val = out_metrics["psnr"].item()
         # ----------------------
@@ -175,7 +205,9 @@ def main():
         router_logits = out["router_logits"]
 
     if router_logits is None:
-        print("Error: No router logits returned. The model might not be using MoE layers.")
+        print(
+            "Error: No router logits returned. The model might not be using MoE layers."
+        )
         return
 
     # 7. Unpad / Crop Logic
@@ -187,20 +219,20 @@ def main():
 
     # 8. Visualization Plotting
     num_layers = len(router_logits)
-    
+
     # Grid calculation
-    cols = 4 
+    cols = 4
     # Items to plot: Original, Recon, Legend, then N layers
     total_items = 3 + num_layers
     rows = math.ceil(total_items / cols)
-    
+
     fig = plt.figure(figsize=(20, 5 * rows))
 
     # --- Plot 1: Original ---
     ax = fig.add_subplot(rows, cols, 1)
     ax.imshow(x_orig.squeeze().permute(1, 2, 0).cpu().numpy())
     ax.set_title("Original Input")
-    ax.axis('off')
+    ax.axis("off")
 
     # --- Plot 2: Reconstruction ---
     ax = fig.add_subplot(rows, cols, 2)
@@ -208,59 +240,70 @@ def main():
     ax.imshow(x_hat_np)
     # Display the calculated metrics
     ax.set_title(f"Reconstruction\nBPP: {bpp_val:.3f} | PSNR: {psnr_val:.2f} dB")
-    ax.axis('off')
-    
+    ax.axis("off")
+
     # --- Plot 3: Legend ---
     ax = fig.add_subplot(rows, cols, 3)
     cmap = get_expert_colormap(4)
-    patches = [plt.Rectangle((0,0),1,1, color=cmap(i)) for i in range(4)]
-    ax.legend(patches, [f"Expert {i}" for i in range(4)], loc='center', fontsize='large')
-    ax.axis('off')
+    patches = [plt.Rectangle((0, 0), 1, 1, color=cmap(i)) for i in range(4)]
+    ax.legend(
+        patches, [f"Expert {i}" for i in range(4)], loc="center", fontsize="large"
+    )
+    ax.axis("off")
     ax.set_title("Expert Color Map")
 
     # --- Plot MoE Layers ---
     # HMMC Architecture: Standard Slices -> Anchor -> Non-Anchor
     # Assuming the list order matches the forward pass
-    layer_names = [f"Standard Slice {i}" for i in range(num_layers - 2)] + ["Anchor Slice", "Non-Anchor Slice"]
-    
+    layer_names = [f"Standard Slice {i}" for i in range(num_layers - 2)] + [
+        "Anchor Slice",
+        "Non-Anchor Slice",
+    ]
+
     for i, layer_data in enumerate(router_logits):
-        if layer_data is None: continue
-            
+        if layer_data is None:
+            continue
+
         # layer_data is tuple: (logits, indices)
         # indices shape: [Batch, H_latent, W_latent, TopK]
         logits, indices = layer_data
-        
+
         # Get Top-1 Expert Choice map for the first image in batch
         # shape: [H_latent, W_latent]
-        expert_map_latent = indices[0, :, :, 0] 
-        
+        expert_map_latent = indices[0, :, :, 0]
+
         # Overlay on padded reconstruction first
-        blended_padded, raw_map = overlay_expert_map(x_hat_padded.clamp(0,1), expert_map_latent, alpha=args.alpha)
-        
+        blended_padded, raw_map = overlay_expert_map(
+            x_hat_padded.clamp(0, 1), expert_map_latent, alpha=args.alpha
+        )
+
         # Crop the result to remove padding
         blended_cropped = blended_padded[:orig_h, :orig_w, :]
-        
+
         # Calculate Usage Stats
         unique, counts = np.unique(raw_map, return_counts=True)
         total_px = raw_map.size
-        stats_str = ", ".join([f"E{int(u)}:{c/total_px:.0%}" for u, c in zip(unique, counts)])
-        
+        stats_str = ", ".join(
+            [f"E{int(u)}:{c/total_px:.0%}" for u, c in zip(unique, counts)]
+        )
+
         # Add Subplot
         ax = fig.add_subplot(rows, cols, i + 4)
         ax.imshow(blended_cropped)
-        
+
         # Determine Title
         t_name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
         ax.set_title(f"{t_name}\nTop-1 Usage: {stats_str}", fontsize=10)
-        ax.axis('off')
+        ax.axis("off")
 
     plt.tight_layout()
-    
+
     save_filename = f"vis_{os.path.basename(args.image).split('.')[0]}.png"
     save_path = os.path.join(args.save_dir, save_filename)
     plt.savefig(save_path, dpi=150)
     print(f"6. Visualization saved to: {save_path}")
     plt.close()
+
 
 if __name__ == "__main__":
     main()
