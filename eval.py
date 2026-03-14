@@ -43,6 +43,7 @@ def compute_bpp_estimated(out_net, orig_shape):
         bpp += torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
     return bpp.item()
 
+
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="HMMC Evaluation Script")
     parser.add_argument(
@@ -106,7 +107,6 @@ def main(argv):
         x = to_tensor(img).unsqueeze(0).to(device)
         orig_shape = x.size()
         num_pixels = orig_shape[0] * orig_shape[2] * orig_shape[3]
-
 
         with torch.no_grad():
             if args.real:
