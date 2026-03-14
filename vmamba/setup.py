@@ -44,8 +44,8 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
-# MODES = ["oflex"]
-MODES = ["core", "oflex"]
+MODES = ["oflex"]
+# MODES = ["core", "oflex"]
 # MODES = ["core", "ndstate", "oflex", "nrow"]
 
 
