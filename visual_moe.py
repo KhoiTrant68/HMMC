@@ -10,10 +10,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from loss.loss import RateDistortionLoss
-
 # --- LOCAL MODULE IMPORTS ---
-# Ensure your folder structure has 'model/' and 'loss/' directories
 from model.hmmc import HMMC
 
 
@@ -52,7 +49,7 @@ def load_image(path, device):
     transform = transforms.Compose([transforms.ToTensor()])
     x = transform(img).unsqueeze(0).to(device)  # [1, 3, H, W]
 
-    # Pad to multiple of 64 (Model requirement)
+    # Pad to multiple of 64 (Model requirement for 6 downsampling layers)
     h, w = x.shape[2:]
     p_h = (64 - (h % 64)) % 64
     p_w = (64 - (w % 64)) % 64
@@ -76,32 +73,27 @@ def clean_state_dict(state_dict):
 def get_model_params_from_state_dict(state_dict):
     """
     Infers N and M parameters by inspecting weight shapes.
-    Standard HMMC: g_a.0... (Input) -> g_a.6... (Output to Latent)
     """
     try:
-        # Check first conv of hyper-prior or last conv of encoder
         if "h_a.0.conv_down.weight" in state_dict:
-            # Shape is [N, M, 5, 5]
             N = state_dict["h_a.0.conv_down.weight"].shape[0]
             M = state_dict["h_a.0.conv_down.weight"].shape[1]
             print(f"   [Auto-Detect] Hyperparameters found: N={N}, M={M}")
             return N, M
         elif "g_a.6.weight" in state_dict:
-            # Shape is [M, 256, 5, 5] (Assuming previous block output 256)
             M = state_dict["g_a.6.weight"].shape[0]
             print(f"   [Auto-Detect] M={M} found. Defaulting N=192.")
             return 192, M
     except Exception as e:
         print(f"   [Warning] Could not infer params: {e}")
 
-    print("   [Warning] Using default N=192, M=320.")
+    print("[Warning] Using default N=192, M=320.")
     return 192, 320
 
 
 def get_expert_colormap(num_experts=4):
     """Defines colors for experts: Red, Green, Blue, Yellow."""
     colors = ["#FF0000", "#00FF00", "#0000FF", "#FFFF00"]
-    # If more experts, cycle or add more
     if num_experts > 4:
         extra_colors = ["#00FFFF", "#FF00FF", "#FFFFFF", "#000000"]
         colors.extend(extra_colors[: num_experts - 4])
@@ -111,26 +103,21 @@ def get_expert_colormap(num_experts=4):
 def overlay_expert_map(img_tensor, expert_indices, alpha=0.4, num_experts=4):
     """
     Overlays expert choices onto the image.
-    img_tensor: [1, 3, H, W] (The reconstructed image)
+    img_tensor:[1, 3, H, W] (The reconstructed image)
     expert_indices: [H_feat, W_feat] (The latent map)
     """
-    # Convert image to numpy [H, W, 3]
     img_np = img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
     H, W, _ = img_np.shape
 
-    # Resize expert map to Image Size using Nearest Neighbor (to keep integers)
+    # Resize expert map to Image Size using Nearest Neighbor
     expert_map_tensor = expert_indices.unsqueeze(0).unsqueeze(0).float()
     expert_map_up = F.interpolate(expert_map_tensor, size=(H, W), mode="nearest")
     expert_map_up = expert_map_up.squeeze().cpu().numpy()  # [H, W]
 
-    # Create Color Map
     cmap = get_expert_colormap(num_experts)
     norm = mcolors.BoundaryNorm(np.arange(-0.5, num_experts + 0.5, 1), cmap.N)
 
-    # Apply colormap -> [H, W, 4] (RGBA)
     colored_map = cmap(norm(expert_map_up))
-
-    # Extract RGB for blending
     overlay_rgb = colored_map[..., :3]
 
     # Blend: (1-alpha)*Original + alpha*Overlay
@@ -144,23 +131,18 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 1. Device Setup
     if torch.cuda.is_available():
         device = "cuda"
     else:
-        print(
-            "WARNING: CUDA not found. HMMC uses Mamba/Triton kernels which usually fail on CPU."
-        )
+        print("WARNING: CUDA not found. Mamba/Triton kernels usually fail on CPU.")
         device = "cpu"
     print(f"1. Device set to: {device}")
 
-    # 2. Load Checkpoint
     print(f"2. Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
     state_dict = clean_state_dict(state_dict)
 
-    # 3. Model Init
     N, M = get_model_params_from_state_dict(state_dict)
     model = HMMC(N=N, M=M)
 
@@ -178,28 +160,15 @@ def main():
     # Important: Update scale tables for entropy model
     model.update(force=True)
 
-    # 4. Criterion Init (THE FIX FOR BPP=0)
-    criterion = RateDistortionLoss().to(device)
-
-    # 5. Load Image
     x_padded, (orig_h, orig_w) = load_image(args.image, device)
     print(
         f"3. Image loaded. Original: {orig_h}x{orig_w}, Padded: {x_padded.shape[2]}x{x_padded.shape[3]}"
     )
 
-    # 6. Inference & Loss Calculation
     print("4. Running inference...")
     with torch.no_grad():
         # Use 'ste' (Straight-Through Estimator) to simulate quantization rounding
         out = model(x_padded, training_mode="ste")
-
-        # --- CALCULATE LOSS ---
-        # This populates 'bpp_loss', 'mse_loss', 'psnr'
-        out_metrics = criterion(out, x_padded)
-
-        bpp_val = out_metrics["bpp_loss"].item()
-        psnr_val = out_metrics["psnr"].item()
-        # ----------------------
 
         x_hat_padded = out["x_hat"]
         router_logits = out["router_logits"]
@@ -210,19 +179,30 @@ def main():
         )
         return
 
-    # 7. Unpad / Crop Logic
-    # We computed loss on padded, but we visualize exact original size
-    x_hat = x_hat_padded[:, :, :orig_h, :orig_w]
+    # Unpad / Crop Logic
+    x_hat = x_hat_padded[:, :, :orig_h, :orig_w].clamp_(0, 1)
     x_orig = x_padded[:, :, :orig_h, :orig_w]
+
+    # ACCURATE METRICS: Calculate specifically on unpadded dimensions to prevent BPP leakage
+    mse_val = torch.mean((x_hat - x_orig) ** 2).item()
+    psnr_val = -10 * math.log10(mse_val) if mse_val > 0 else 100.0
+
+    num_pixels = orig_h * orig_w
+    bpp_val = 0.0
+    for likelihoods in out["likelihoods"].values():
+        if isinstance(likelihoods, torch.Tensor):
+            bpp_val += torch.log2(likelihoods.clamp(min=1e-9)).sum().item() / (
+                -num_pixels
+            )
+        else:
+            for l in likelihoods:
+                bpp_val += torch.log2(l.clamp(min=1e-9)).sum().item() / (-num_pixels)
 
     print(f"5. Metrics Calculated -> BPP: {bpp_val:.4f}, PSNR: {psnr_val:.2f} dB")
 
-    # 8. Visualization Plotting
+    # Visualization Plotting
     num_layers = len(router_logits)
-
-    # Grid calculation
     cols = 4
-    # Items to plot: Original, Recon, Legend, then N layers
     total_items = 3 + num_layers
     rows = math.ceil(total_items / cols)
 
@@ -236,9 +216,8 @@ def main():
 
     # --- Plot 2: Reconstruction ---
     ax = fig.add_subplot(rows, cols, 2)
-    x_hat_np = x_hat.squeeze().permute(1, 2, 0).cpu().clamp(0, 1).numpy()
+    x_hat_np = x_hat.squeeze().permute(1, 2, 0).cpu().numpy()
     ax.imshow(x_hat_np)
-    # Display the calculated metrics
     ax.set_title(f"Reconstruction\nBPP: {bpp_val:.3f} | PSNR: {psnr_val:.2f} dB")
     ax.axis("off")
 
@@ -253,8 +232,6 @@ def main():
     ax.set_title("Expert Color Map")
 
     # --- Plot MoE Layers ---
-    # HMMC Architecture: Standard Slices -> Anchor -> Non-Anchor
-    # Assuming the list order matches the forward pass
     layer_names = [f"Standard Slice {i}" for i in range(num_layers - 2)] + [
         "Anchor Slice",
         "Non-Anchor Slice",
@@ -264,34 +241,30 @@ def main():
         if layer_data is None:
             continue
 
-        # layer_data is tuple: (logits, indices)
-        # indices shape: [Batch, H_latent, W_latent, TopK]
+        # indices shape:[Batch, H_latent, W_latent, TopK]
         logits, indices = layer_data
 
-        # Get Top-1 Expert Choice map for the first image in batch
-        # shape: [H_latent, W_latent]
+        # Get Top-1 Expert Choice map
         expert_map_latent = indices[0, :, :, 0]
 
-        # Overlay on padded reconstruction first
+        # Overlay on padded reconstruction first to ensure scaling alignment
         blended_padded, raw_map = overlay_expert_map(
             x_hat_padded.clamp(0, 1), expert_map_latent, alpha=args.alpha
         )
 
-        # Crop the result to remove padding
+        # Crop the result to remove padding area
         blended_cropped = blended_padded[:orig_h, :orig_w, :]
 
-        # Calculate Usage Stats
+        # Calculate Usage Stats on the whole latent map
         unique, counts = np.unique(raw_map, return_counts=True)
         total_px = raw_map.size
         stats_str = ", ".join(
             [f"E{int(u)}:{c/total_px:.0%}" for u, c in zip(unique, counts)]
         )
 
-        # Add Subplot
         ax = fig.add_subplot(rows, cols, i + 4)
         ax.imshow(blended_cropped)
 
-        # Determine Title
         t_name = layer_names[i] if i < len(layer_names) else f"Layer {i}"
         ax.set_title(f"{t_name}\nTop-1 Usage: {stats_str}", fontsize=10)
         ax.axis("off")
