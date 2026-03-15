@@ -407,13 +407,16 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         )
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        q = self.q_high(self.ln_high(hf)).view(B, H * W, 1, C_high)
+        # CRITICAL FIX: Ensure exact 3D shape (B*H*W, 1, C_high) for batch matrix multiplication
+        q = self.q_high(self.ln_high(hf)).view(B * H * W, 1, C_high)
+
         reshaped_keys = self.k_high(self.ln_dict_high(self.experts_high)).view(
             self.num_experts, -1, C_high
         )
         reshaped_vals = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
 
-        final_out = torch.zeros(B, H * W, C_high, device=hf.device, dtype=hf.dtype)
+        # Track the accumulated output exactly on the flatted space
+        final_out = torch.zeros(B * H * W, C_high, device=hf.device, dtype=hf.dtype)
 
         for k_idx in range(2):
             expert_idx = topk_indices[..., k_idx].view(-1)
@@ -424,8 +427,8 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
             attn = torch.matmul(q, K_sel.transpose(1, 2)) * (C_high**-0.5)
             attn = F.softmax(attn, dim=-1)
 
-            expert_out = torch.matmul(attn, V_sel).view(B, H * W, C_high)
-            weight = topk_probs[..., k_idx].view(B, H * W, 1)
+            expert_out = torch.matmul(attn, V_sel).view(B * H * W, C_high)
+            weight = topk_probs[..., k_idx].view(B * H * W, 1)
             final_out += expert_out * weight
 
         return final_out.view(B, H, W, C_high), (routing_logits, topk_indices)
@@ -802,7 +805,6 @@ class HMMC(CompressionModel):
             y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
             y_hat_slice = y_q_slice + mu
 
-            # CRITICAL FIX: Add offset and constrain for valid ANS symbols
             symbols = (y_q_slice + self.gaussian_conditional._offset).to(torch.int32)
             symbols = symbols.clamp(
                 0, self.gaussian_conditional._quantized_cdf.size(1) - 2
@@ -905,7 +907,6 @@ class HMMC(CompressionModel):
                 1, -1, y_shape[0], y_shape[1]
             )
 
-            # CRITICAL FIX: Revert the offset addition from compression
             y_q_slice = rv - self.gaussian_conditional._offset
             y_hat_slice = y_q_slice + mu
 
