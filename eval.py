@@ -21,8 +21,6 @@ from model.hmmc import HMMC
 
 warnings.filterwarnings("ignore")
 
-# --- Helper Functions ---
-
 
 def compute_psnr(a, b):
     mse = torch.mean((a - b) ** 2).item()
@@ -36,11 +34,10 @@ def compute_msssim(a, b):
     return -10 * math.log10(max(1 - ms_val, 1e-10))
 
 
-def compute_bpp_estimated(out_net, orig_shape):
-    num_pixels = orig_shape[0] * orig_shape[2] * orig_shape[3]
+def compute_bpp_estimated(out_net, num_pixels):
     bpp = 0
     for likelihoods in out_net["likelihoods"].values():
-        bpp += torch.log(likelihoods).sum() / (-math.log(2) * num_pixels)
+        bpp += torch.log2(likelihoods).sum() / (-num_pixels)
     return bpp.item()
 
 
@@ -58,9 +55,6 @@ def parse_args(argv):
     parser.add_argument("--cuda", action="store_true", help="Use CUDA")
     parser.add_argument("--real", action="store_true", help="Actual compression")
     return parser.parse_args(argv)
-
-
-# --- Main Logic ---
 
 
 def main(argv):
@@ -105,8 +99,10 @@ def main(argv):
     for img_file in img_list:
         img = Image.open(img_file).convert("RGB")
         x = to_tensor(img).unsqueeze(0).to(device)
+
         orig_shape = x.size()
-        num_pixels = orig_shape[0] * orig_shape[2] * orig_shape[3]
+        orig_h, orig_w = orig_shape[2], orig_shape[3]
+        num_pixels = orig_shape[0] * orig_h * orig_w
 
         with torch.no_grad():
             if args.real:
@@ -126,7 +122,8 @@ def main(argv):
                     torch.cuda.synchronize()
                 t_dec = time.time() - t_start
 
-                x_hat = out_dec["x_hat"].clamp_(0, 1)
+                # Safe crop applied just in case ConvTranspose2d output_padding creates a +1 spatial dimension mismatch
+                x_hat = out_dec["x_hat"][:, :, :orig_h, :orig_w].clamp_(0, 1)
 
                 y_bits = len(out_enc["strings"][0][0]) * 8.0
                 z_bits = sum(len(s) for s in out_enc["strings"][1]) * 8.0
@@ -144,8 +141,10 @@ def main(argv):
                     torch.cuda.synchronize()
                 t_total = time.time() - t_start
 
-                x_hat = out_net["x_hat"].clamp_(0, 1)
-                current_bpp = compute_bpp_estimated(out_net, orig_shape)
+                # Safe crop applied just in case ConvTranspose2d output_padding creates a +1 spatial dimension mismatch
+                x_hat = out_net["x_hat"][:, :, :orig_h, :orig_w].clamp_(0, 1)
+
+                current_bpp = compute_bpp_estimated(out_net, num_pixels)
                 metrics["time_total"] += t_total
 
         current_psnr = compute_psnr(x, x_hat)

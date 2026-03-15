@@ -28,7 +28,12 @@ class LossFreeBalancer:
         self.update_rate = update_rate
 
     @torch.no_grad()
-    def update_biases(self, model, router_data_tuple, accelerator=None):
+    def update_biases(self, model, router_data_tuple):
+        """
+        Updated to avoid DDP deadlock. Computes local updates only.
+        Since expert_biases are registered buffers, DDP will broadcast them automatically
+        during the forward pass if broadcast_buffers=True (default).
+        """
         if not router_data_tuple:
             return
 
@@ -41,16 +46,8 @@ class LossFreeBalancer:
                 topk_indices.flatten(), minlength=self.num_experts
             ).float()
 
-            if accelerator and accelerator.num_processes > 1:
-                expert_counts = accelerator.reduce(
-                    local_counts.clone(), reduction="sum"
-                )
-            else:
-                expert_counts = local_counts
-
-            avg_count = expert_counts.mean()
-            error = avg_count - expert_counts
-
+            avg_count = local_counts.mean()
+            error = avg_count - local_counts
             error_ratio = error / (avg_count + 1e-8)
             update_step = self.update_rate * error_ratio.clamp(-5.0, 5.0)
 
@@ -58,13 +55,6 @@ class LossFreeBalancer:
             if moe_module is not None and hasattr(moe_module, "expert_biases"):
                 device = moe_module.expert_biases.device
                 moe_module.expert_biases.data.add_(update_step.to(device))
-
-                # DDP SYNCHRONIZATION: Prevent bias drift across GPUs
-                if accelerator and accelerator.num_processes > 1:
-                    import torch.distributed as dist
-
-                    if dist.is_initialized():
-                        dist.broadcast(moe_module.expert_biases.data, src=0)
 
     def _get_module_by_index(self, model, index):
         if not hasattr(model, "dt_cross_attention"):
@@ -146,16 +136,13 @@ def train_one_epoch(
         unwrapped_model = accelerator.unwrap_model(model)
 
         if "router_logits" in out_net and out_net["router_logits"]:
-            balancer.update_biases(
-                unwrapped_model, out_net["router_logits"], accelerator
-            )
+            balancer.update_biases(unwrapped_model, out_net["router_logits"])
 
         aux_loss = unwrapped_model.aux_loss()
         accelerator.backward(aux_loss)
         aux_optimizer.step()
 
         if ema_model is not None:
-            #  Ensure EMA is updated with the underlying unwrapped model
             ema_model.update(unwrapped_model)
 
         loss_meter.update(loss.item())

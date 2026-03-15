@@ -74,43 +74,13 @@ def get_haar_filters(channels):
     return filters.repeat(channels, 1, 1, 1)
 
 
-class DWT_Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, filters):
-        ctx.save_for_backward(filters)
-        C = x.shape[1]  # Base channels
-        return F.conv2d(x, filters, stride=2, groups=C)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (filters,) = ctx.saved_tensors
-        C = grad_output.shape[1] // 4
-        grad_x = F.conv_transpose2d(grad_output, filters, stride=2, groups=C)
-        return grad_x, None
-
-
-class IDWT_Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, filters):
-        ctx.save_for_backward(filters)
-        C = x.shape[1] // 4  # Base channels
-        return F.conv_transpose2d(x, filters, stride=2, groups=C)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (filters,) = ctx.saved_tensors
-        C = grad_output.shape[1]
-        grad_x = F.conv2d(grad_output, filters, stride=2, groups=C)
-        return grad_x, None
-
-
 class DWT(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.register_buffer("filters", get_haar_filters(channels))
 
     def forward(self, x):
-        return DWT_Function.apply(x, self.filters)
+        return F.conv2d(x, self.filters, stride=2, groups=x.shape[1])
 
 
 class IDWT(nn.Module):
@@ -119,7 +89,7 @@ class IDWT(nn.Module):
         self.register_buffer("filters", get_haar_filters(channels))
 
     def forward(self, x):
-        return IDWT_Function.apply(x, self.filters)
+        return F.conv_transpose2d(x, self.filters, stride=2, groups=x.shape[1] // 4)
 
 
 # ==========================================
@@ -412,7 +382,6 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.res_scale_2 = Scale(c_block, init_value=1.0)
 
         self.register_buffer("expert_biases", torch.zeros(num_experts))
-        self.last_routing_logits, self.last_routing_indices = None, None
 
         trunc_normal_(self.dict_low, std=0.02)
         trunc_normal_(self.experts_high, std=0.02)
@@ -430,30 +399,36 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
     def process_high_freq_guided(self, hf, lf):
         B, H, W, C_high = hf.shape
         routing_logits = self.router(torch.cat([hf, lf], dim=-1))
-        self.last_routing_logits = routing_logits
         biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
-        _, topk_indices = torch.topk(biased_logits, k=2, dim=-1)
-        self.last_routing_indices = topk_indices
 
-        unbiased_probs = F.softmax(routing_logits, dim=-1)
-        mask = torch.zeros_like(unbiased_probs).scatter_(-1, topk_indices, 1.0)
-        masked_probs = unbiased_probs * mask
-        routing_weights = masked_probs / (masked_probs.sum(dim=-1, keepdim=True) + 1e-8)
+        # Sparse routing: O(K) execution
+        topk_probs, topk_indices = torch.topk(
+            F.softmax(biased_logits, dim=-1), k=2, dim=-1
+        )
+        topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        q = self.q_high(self.ln_high(hf)).reshape(-1, C_high)
-        all_keys = self.k_high(self.ln_dict_high(self.experts_high))
+        q = self.q_high(self.ln_high(hf)).view(B, H * W, 1, C_high)
+        reshaped_keys = self.k_high(self.ln_dict_high(self.experts_high)).view(
+            self.num_experts, -1, C_high
+        )
+        reshaped_vals = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
 
-        sim = torch.matmul(q, all_keys.transpose(0, 1)) * (C_high**-0.5)
-        sim = sim.view(B, H * W, self.num_experts, -1)
+        final_out = torch.zeros(B, H * W, C_high, device=hf.device, dtype=hf.dtype)
 
-        attn = F.softmax(sim.float(), dim=-1).type_as(sim)
+        for k_idx in range(2):
+            expert_idx = topk_indices[..., k_idx].view(-1)
 
-        v_experts = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
-        expert_outputs = torch.einsum("bhke,kec->bhkc", attn, v_experts)
-        router_weights_flat = routing_weights.view(B, H * W, self.num_experts, 1)
-        final_out = (expert_outputs * router_weights_flat).sum(dim=2)
+            K_sel = reshaped_keys[expert_idx]
+            V_sel = reshaped_vals[expert_idx]
 
-        return final_out.view(B, H, W, C_high)
+            attn = torch.matmul(q, K_sel.transpose(1, 2)) * (C_high**-0.5)
+            attn = F.softmax(attn, dim=-1)
+
+            expert_out = torch.matmul(attn, V_sel).view(B, H * W, C_high)
+            weight = topk_probs[..., k_idx].view(B, H * W, 1)
+            final_out += expert_out * weight
+
+        return final_out.view(B, H, W, C_high), (routing_logits, topk_indices)
 
     def forward(self, x):
         shortcut = x
@@ -461,7 +436,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
         ll, hf = self.dwt(x_emb)
         ll_processed = self.process_low_freq(ll)
-        hf_processed = self.process_high_freq_guided(
+        hf_processed, routing_data = self.process_high_freq_guided(
             hf.permute(0, 2, 3, 1), ll_processed.permute(0, 2, 3, 1)
         )
         hf_processed = hf_processed.permute(0, 3, 1, 2)
@@ -473,7 +448,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         out = self.output_trans(recon.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         if self.input_dim == self.output_dim:
             out = out + shortcut
-        return out
+        return out, routing_data
 
 
 # ==========================================
@@ -518,11 +493,9 @@ class HMMC(CompressionModel):
         self.num_standard_slices = len(self.groups) - 2
         self.last_slice_dim = self.groups[-1]
 
-        # BACKBONE: MAMBA
         feature_dim = [96, 144, 256]
         block_counts = [2, 3, 6]
 
-        # Encoder
         self.g_a = nn.Sequential(
             ConvBottleneckBlockWithStride(3, feature_dim[0]),
             MambaBlockSequence(
@@ -539,7 +512,6 @@ class HMMC(CompressionModel):
             nn.Conv2d(feature_dim[2], M, kernel_size=5, stride=2, padding=2),
         )
 
-        # Decoder
         self.g_s = nn.Sequential(
             nn.ConvTranspose2d(
                 M, feature_dim[2], kernel_size=5, stride=2, output_padding=1, padding=2
@@ -558,7 +530,6 @@ class HMMC(CompressionModel):
             ConvBottleneckBlockWithUpsample(feature_dim[0], 3),
         )
 
-        # Hyper-Prior
         self.h_a = nn.Sequential(
             ConvBottleneckBlockWithStride(M, N),
             MambaBlock(N),
@@ -579,7 +550,6 @@ class HMMC(CompressionModel):
             ConvBottleneckBlockWithUpsample(N, M),
         )
 
-        # ENTROPY
         self.dt_cross_attention = nn.ModuleList()
         self.context_transforms = nn.ModuleList()
         self.mean_transforms = nn.ModuleList()
@@ -587,12 +557,9 @@ class HMMC(CompressionModel):
         self.lrp_transforms = nn.ModuleList()
 
         cum_channels = 0
-
-        # A. Standard Slices
         for i in range(self.num_standard_slices):
             current_dim = self.groups[i + 1]
             moe_input_dim = (M * 2) + cum_channels
-
             self.dt_cross_attention.append(
                 SpectralMoEDictionaryCrossAttention(
                     input_dim=moe_input_dim,
@@ -604,7 +571,6 @@ class HMMC(CompressionModel):
             )
             support_dim = M + (M * 2) + cum_channels
             self.context_transforms.append(NAFBlock(support_dim, inter_dim=128))
-
             self.mean_transforms.append(
                 nn.Sequential(
                     nn.Conv2d(support_dim, 224, 3, 1, 1),
@@ -633,11 +599,6 @@ class HMMC(CompressionModel):
         )
         self.hyper_down = nn.Conv2d(M * 2, M * 2, kernel_size=2, stride=2)
 
-        # LATENT HAAR DWT/IDWT Modules using proper dynamically calculated shapes
-        self.latent_dwt = DWT(M)
-        self.latent_idwt = IDWT(M)
-
-        # B. Checkerboard
         self.checkerboard_split = CheckerboardSplitter()
         self.checkerboard_merge = CheckerboardMerger()
 
@@ -650,7 +611,6 @@ class HMMC(CompressionModel):
         )
         support_dim_anc = M + (M * 2) + cum_channels
         self.naf_anchor = NAFBlock(support_dim_anc, inter_dim=128)
-
         self.mean_anchor = nn.Sequential(
             nn.Conv2d(support_dim_anc, 224, 3, 1, 1),
             nn.GELU(),
@@ -678,7 +638,6 @@ class HMMC(CompressionModel):
         support_dim_na = M + fusion_input_dim
         self.naf_non_anchor = NAFBlock(support_dim_na, inter_dim=128)
         out_na_dim = self.last_slice_dim * 3
-
         self.mean_non_anchor = nn.Sequential(
             nn.Conv2d(support_dim_na, 224, 3, 1, 1),
             nn.GELU(),
@@ -719,27 +678,18 @@ class HMMC(CompressionModel):
         hyper_info = torch.cat([latent_means, latent_scales], dim=1)
 
         y_slices = y.split(self.groups[1:], 1)
-        y_hat_slices = []
-        y_likelihood = []
-        all_logits = []
+        y_hat_slices, y_likelihood, all_logits = [], [], []
 
-        # A. Standard Slices
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
-            if i == 0:
-                query = hyper_info
-            else:
-                prev_slices = torch.cat(y_hat_slices, dim=1)
-                query = torch.cat([hyper_info, prev_slices], dim=1)
+            query = (
+                hyper_info
+                if i == 0
+                else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
+            )
 
-            dict_info = self.dt_cross_attention[i](query)
-            if hasattr(self.dt_cross_attention[i], "last_routing_logits"):
-                all_logits.append(
-                    (
-                        self.dt_cross_attention[i].last_routing_logits,
-                        self.dt_cross_attention[i].last_routing_indices,
-                    )
-                )
+            dict_info, routing_data = self.dt_cross_attention[i](query)
+            all_logits.append(routing_data)
 
             support = torch.cat([dict_info, query], dim=1)
             support_feat = self.context_transforms[i](support)
@@ -751,90 +701,64 @@ class HMMC(CompressionModel):
             _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
             y_likelihood.append(y_slice_likelihood)
 
-            if self.training and training_mode == "noise":
-                y_hat_slice = y_slice + torch.empty_like(y_slice).uniform_(-0.5, 0.5)
-            else:
-                y_hat_slice = ste_round(y_slice - mu) + mu
+            y_hat_slice = (
+                y_slice + torch.empty_like(y_slice).uniform_(-0.5, 0.5)
+                if self.training and training_mode == "noise"
+                else ste_round(y_slice - mu) + mu
+            )
+            lrp = self.lrp_transforms[i](torch.cat([support_feat, y_hat_slice], dim=1))
+            y_hat_slices.append(y_hat_slice + (0.5 * torch.tanh(lrp)))
 
-            lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
-            lrp = self.lrp_transforms[i](lrp_in)
-            y_hat_slice = y_hat_slice + (0.5 * torch.tanh(lrp))
-
-            y_hat_slices.append(y_hat_slice)
-
-        # B. Checkerboard
         last_slice = y_slices[-1]
         y_anchor, y_non_anchor = self.checkerboard_split(last_slice)
 
-        # Apply phase-aligned downsampling explicitly
-        prev_slices_full = torch.cat(y_hat_slices, dim=1)
-        prev_slices_down = self.prev_slices_down(prev_slices_full)
+        prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        # Anchor
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
-        dict_info_anc = self.moe_anchor(query_anc)
-        if hasattr(self.moe_anchor, "last_routing_logits"):
-            all_logits.append(
-                (
-                    self.moe_anchor.last_routing_logits,
-                    self.moe_anchor.last_routing_indices,
-                )
-            )
+        dict_info_anc, routing_data_anc = self.moe_anchor(query_anc)
+        all_logits.append(routing_data_anc)
 
-        support_anc = torch.cat([dict_info_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
+        feat_anc = self.naf_anchor(torch.cat([dict_info_anc, query_anc], dim=1))
         mu_anc, scale_anc = self.mean_anchor(feat_anc), self.scale_anchor(feat_anc)
         _, y_lik_anc = self.gaussian_conditional(y_anchor, scale_anc, mu_anc)
 
-        if self.training and training_mode == "noise":
-            y_hat_anc = y_anchor + torch.empty_like(y_anchor).uniform_(-0.5, 0.5)
-        else:
-            y_hat_anc = ste_round(y_anchor - mu_anc) + mu_anc
-
+        y_hat_anc = (
+            y_anchor + torch.empty_like(y_anchor).uniform_(-0.5, 0.5)
+            if self.training and training_mode == "noise"
+            else ste_round(y_anchor - mu_anc) + mu_anc
+        )
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        # Non-Anchor
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
-        dict_info_na = self.moe_non_anchor(query_na)
-        if hasattr(self.moe_non_anchor, "last_routing_logits"):
-            all_logits.append(
-                (
-                    self.moe_non_anchor.last_routing_logits,
-                    self.moe_non_anchor.last_routing_indices,
-                )
-            )
+        dict_info_na, routing_data_na = self.moe_non_anchor(query_na)
+        all_logits.append(routing_data_na)
 
-        support_na = torch.cat([dict_info_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
+        feat_na = self.naf_non_anchor(torch.cat([dict_info_na, query_na], dim=1))
         mu_na, scale_na = self.mean_non_anchor(feat_na), self.scale_non_anchor(feat_na)
         _, y_lik_na = self.gaussian_conditional(y_non_anchor, scale_na, mu_na)
 
-        if self.training and training_mode == "noise":
-            y_hat_na = y_non_anchor + torch.empty_like(y_non_anchor).uniform_(-0.5, 0.5)
-        else:
-            y_hat_na = ste_round(y_non_anchor - mu_na) + mu_na
-
+        y_hat_na = (
+            y_non_anchor + torch.empty_like(y_non_anchor).uniform_(-0.5, 0.5)
+            if self.training and training_mode == "noise"
+            else ste_round(y_non_anchor - mu_na) + mu_na
+        )
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
-        # Merge
         y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
         y_lik_last = self.checkerboard_merge(y_lik_anc, y_lik_na)
 
         y_hat_slices.append(y_hat_last)
         y_likelihood.append(y_lik_last)
 
-        # Recon
-        y_hat = torch.cat(y_hat_slices, dim=1)
-
-        x_hat = self.g_s(y_hat)
+        x_hat = self.g_s(torch.cat(y_hat_slices, dim=1))
 
         return {
             "x_hat": x_hat,
             "likelihoods": {"y": torch.cat(y_likelihood, dim=1), "z": z_likelihoods},
-            "router_logits": tuple(all_logits) if all_logits else None,
+            "router_logits": tuple(all_logits),
         }
 
     def compress(self, x):
@@ -849,28 +773,26 @@ class HMMC(CompressionModel):
         hyper_info = torch.cat([latent_means, latent_scales], dim=1)
 
         y_slices = y.split(self.groups[1:], 1)
-        y_hat_slices = []
+        y_hat_slices, all_symbols, all_indexes = [], [], []
 
         cdf = self.gaussian_conditional.quantized_cdf.tolist()
         cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
         offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
 
         encoder = BufferedRansEncoder()
-        all_symbols = []
-        all_indexes = []
 
-        # A. Standard
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
-            if i == 0:
-                query = hyper_info
-            else:
-                prev_slices = torch.cat(y_hat_slices, dim=1)
-                query = torch.cat([hyper_info, prev_slices], dim=1)
+            query = (
+                hyper_info
+                if i == 0
+                else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
+            )
 
-            dict_info = self.dt_cross_attention[i](query)
-            support = torch.cat([dict_info, query], dim=1)
-            support_feat = self.context_transforms[i](support)
+            dict_info, _ = self.dt_cross_attention[i](query)
+            support_feat = self.context_transforms[i](
+                torch.cat([dict_info, query], dim=1)
+            )
             mu = self.mean_transforms[i](support_feat)[:, :, : y_shape[0], : y_shape[1]]
             scale = self.scale_transforms[i](support_feat)[
                 :, :, : y_shape[0], : y_shape[1]
@@ -880,46 +802,59 @@ class HMMC(CompressionModel):
             y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
             y_hat_slice = y_q_slice + mu
 
-            all_symbols.append(y_q_slice.reshape(-1))
+            # CRITICAL FIX: Add offset and constrain for valid ANS symbols
+            symbols = (y_q_slice + self.gaussian_conditional._offset).to(torch.int32)
+            symbols = symbols.clamp(
+                0, self.gaussian_conditional._quantized_cdf.size(1) - 2
+            )
+
+            all_symbols.append(symbols.reshape(-1))
             all_indexes.append(index.reshape(-1))
 
-            lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
-            lrp = self.lrp_transforms[i](lrp_in)
+            lrp = self.lrp_transforms[i](torch.cat([support_feat, y_hat_slice], dim=1))
             y_hat_slices.append(y_hat_slice + (0.5 * torch.tanh(lrp)))
 
-        # B. Checkerboard
         last_slice = y_slices[-1]
         y_anc, y_na = self.checkerboard_split(last_slice)
 
         prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        # Anchor
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
-        dict_anc = self.moe_anchor(query_anc)
-        support_anc = torch.cat([dict_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
+        dict_anc, _ = self.moe_anchor(query_anc)
+        feat_anc = self.naf_anchor(torch.cat([dict_anc, query_anc], dim=1))
         mu_anc, scale_anc = self.mean_anchor(feat_anc), self.scale_anchor(feat_anc)
 
         index_anc = self.gaussian_conditional.build_indexes(scale_anc)
         y_q_anc = self.gaussian_conditional.quantize(y_anc, "symbols", mu_anc)
         y_hat_anc = y_q_anc + mu_anc
-        all_symbols.append(y_q_anc.reshape(-1))
+
+        symbols_anc = (y_q_anc + self.gaussian_conditional._offset).to(torch.int32)
+        symbols_anc = symbols_anc.clamp(
+            0, self.gaussian_conditional._quantized_cdf.size(1) - 2
+        )
+
+        all_symbols.append(symbols_anc.reshape(-1))
         all_indexes.append(index_anc.reshape(-1))
 
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        # Non-Anchor
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
-        dict_na = self.moe_non_anchor(query_na)
-        support_na = torch.cat([dict_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
+        dict_na, _ = self.moe_non_anchor(query_na)
+        feat_na = self.naf_non_anchor(torch.cat([dict_na, query_na], dim=1))
         mu_na, scale_na = self.mean_non_anchor(feat_na), self.scale_non_anchor(feat_na)
 
         index_na = self.gaussian_conditional.build_indexes(scale_na)
         y_q_na = self.gaussian_conditional.quantize(y_na, "symbols", mu_na)
-        all_symbols.append(y_q_na.reshape(-1))
+        y_hat_na = y_q_na + mu_na
+
+        symbols_na = (y_q_na + self.gaussian_conditional._offset).to(torch.int32)
+        symbols_na = symbols_na.clamp(
+            0, self.gaussian_conditional._quantized_cdf.size(1) - 2
+        )
+
+        all_symbols.append(symbols_na.reshape(-1))
         all_indexes.append(index_na.reshape(-1))
 
         encoder.encode_with_indexes(
@@ -929,8 +864,7 @@ class HMMC(CompressionModel):
             cdf_lengths,
             offsets,
         )
-        y_string = encoder.flush()
-        return {"strings": [[y_string], z_strings], "shape": z.size()[-2:]}
+        return {"strings": [[encoder.flush()], z_strings], "shape": z.size()[-2:]}
 
     def decompress(self, strings, shape):
         z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
@@ -947,16 +881,17 @@ class HMMC(CompressionModel):
         decoder.set_stream(strings[0][0])
         y_hat_slices = []
 
-        # A. Standard
         for i in range(self.num_standard_slices):
-            if i == 0:
-                query = hyper_info
-            else:
-                query = torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
+            query = (
+                hyper_info
+                if i == 0
+                else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
+            )
 
-            dict_info = self.dt_cross_attention[i](query)
-            support = torch.cat([dict_info, query], dim=1)
-            support_feat = self.context_transforms[i](support)
+            dict_info, _ = self.dt_cross_attention[i](query)
+            support_feat = self.context_transforms[i](
+                torch.cat([dict_info, query], dim=1)
+            )
             mu = self.mean_transforms[i](support_feat)[:, :, : y_shape[0], : y_shape[1]]
             scale = self.scale_transforms[i](support_feat)[
                 :, :, : y_shape[0], : y_shape[1]
@@ -969,21 +904,20 @@ class HMMC(CompressionModel):
             rv = torch.tensor(rv, dtype=torch.float32, device=mu.device).reshape(
                 1, -1, y_shape[0], y_shape[1]
             )
-            y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
 
-            lrp_in = torch.cat([support_feat, y_hat_slice], dim=1)
-            lrp = self.lrp_transforms[i](lrp_in)
+            # CRITICAL FIX: Revert the offset addition from compression
+            y_q_slice = rv - self.gaussian_conditional._offset
+            y_hat_slice = y_q_slice + mu
+
+            lrp = self.lrp_transforms[i](torch.cat([support_feat, y_hat_slice], dim=1))
             y_hat_slices.append(y_hat_slice + (0.5 * torch.tanh(lrp)))
 
-        # B. Checkerboard
         prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        # Anchor
         query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
-        dict_anc = self.moe_anchor(query_anc)
-        support_anc = torch.cat([dict_anc, query_anc], dim=1)
-        feat_anc = self.naf_anchor(support_anc)
+        dict_anc, _ = self.moe_anchor(query_anc)
+        feat_anc = self.naf_anchor(torch.cat([dict_anc, query_anc], dim=1))
         mu_anc, scale_anc = self.mean_anchor(feat_anc), self.scale_anchor(feat_anc)
 
         index_anc = self.gaussian_conditional.build_indexes(scale_anc)
@@ -993,16 +927,15 @@ class HMMC(CompressionModel):
         rv_anc = torch.tensor(
             rv_anc, dtype=torch.float32, device=mu_anc.device
         ).reshape(1, self.last_slice_dim, y_shape[0] // 2, y_shape[1] // 2)
-        y_hat_anc = self.gaussian_conditional.dequantize(rv_anc, mu_anc)
+        y_q_anc = rv_anc - self.gaussian_conditional._offset
+        y_hat_anc = y_q_anc + mu_anc
 
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        # Non-Anchor
         query_na = torch.cat([query_anc, y_hat_anc], dim=1)
-        dict_na = self.moe_non_anchor(query_na)
-        support_na = torch.cat([dict_na, query_na], dim=1)
-        feat_na = self.naf_non_anchor(support_na)
+        dict_na, _ = self.moe_non_anchor(query_na)
+        feat_na = self.naf_non_anchor(torch.cat([dict_na, query_na], dim=1))
         mu_na, scale_na = self.mean_non_anchor(feat_na), self.scale_non_anchor(feat_na)
 
         index_na = self.gaussian_conditional.build_indexes(scale_na)
@@ -1012,18 +945,14 @@ class HMMC(CompressionModel):
         rv_na = torch.tensor(rv_na, dtype=torch.float32, device=mu_na.device).reshape(
             1, self.last_slice_dim * 3, y_shape[0] // 2, y_shape[1] // 2
         )
-        y_hat_na = self.gaussian_conditional.dequantize(rv_na, mu_na)
+        y_q_na = rv_na - self.gaussian_conditional._offset
+        y_hat_na = y_q_na + mu_na
 
         lrp_na = self.lrp_non_anchor(torch.cat([feat_na, y_hat_na], dim=1))
         y_hat_na = y_hat_na + (0.5 * torch.tanh(lrp_na))
 
-        # Merge
-        y_hat_last = self.checkerboard_merge(y_hat_anc, y_hat_na)
-        y_hat_slices.append(y_hat_last)
-
-        y_hat = torch.cat(y_hat_slices, dim=1)
-        x_hat = self.g_s(y_hat).clamp(0, 1)
-        return {"x_hat": x_hat}
+        y_hat_slices.append(self.checkerboard_merge(y_hat_anc, y_hat_na))
+        return {"x_hat": self.g_s(torch.cat(y_hat_slices, dim=1)).clamp(0, 1)}
 
     def load_state_dict(self, state_dict, strict=True):
         update_registered_buffers(

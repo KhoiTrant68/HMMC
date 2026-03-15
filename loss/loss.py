@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 
@@ -43,11 +41,11 @@ class RateDistortionLoss(nn.Module):
         for name, likelihood in output["likelihoods"].items():
             if isinstance(likelihood, (list, tuple)):
                 for l in likelihood:
-                    total_bits += torch.log(l.clamp(min=1e-9)).sum()
+                    total_bits += torch.log2(l.clamp(min=1e-9)).sum()
             else:
-                total_bits += torch.log(likelihood.clamp(min=1e-9)).sum()
+                total_bits += torch.log2(likelihood.clamp(min=1e-9)).sum()
 
-        out["bpp_loss"] = -total_bits / (math.log(2) * num_pixels)
+        out["bpp_loss"] = -total_bits / num_pixels
         x_hat = output["x_hat"].clamp(0, 1)
         mse_val = self.mse(x_hat, target)
         out["mse_loss"] = mse_val
