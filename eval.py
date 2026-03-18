@@ -75,7 +75,7 @@ def main(argv):
     img_list.sort()
 
     print(f"Loading model from {args.checkpoint}...")
-    net = HMMC(N=192, M=320).to(device)
+    net = HMMC(N=128, M=256).to(device)
 
     # Auto-load EMA weights if they exist (crucial for +0.2dB compression baseline)
     ema_path = Path(args.checkpoint).with_name(
