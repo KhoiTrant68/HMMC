@@ -306,7 +306,7 @@ def main():
         pin_memory=True,
     )
 
-    net = HMMC(N=192, M=320)
+    net = HMMC(N=128, M=256)
     ema_model = ModelEmaV2(net, decay=0.999)
     balancer = LossFreeBalancer(num_experts=4, update_rate=args.update_rate)
     optimizer, aux_optimizer = configure_optimizers(net, args)
