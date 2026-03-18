@@ -63,6 +63,7 @@ class RateDistortionLoss(nn.Module):
             else torch.tensor(100.0, device=target.device)
         )
 
+        out["moe_imbalance"] = 0.0
         if "router_logits" in output and output["router_logits"] is not None:
             with torch.no_grad():
                 out["moe_imbalance"] = self._calculate_imbalance(
@@ -86,4 +87,4 @@ class RateDistortionLoss(nn.Module):
                         expert_counts - avg_load
                     ).abs().mean() / avg_load
                     count += 1
-        return total_imbalance / count if count > 0 else 0.0
+        return (total_imbalance / count).item() if count > 0 else 0.0

@@ -7,6 +7,7 @@ import sys
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -28,11 +29,9 @@ class LossFreeBalancer:
         self.update_rate = update_rate
 
     @torch.no_grad()
-    def update_biases(self, model, router_data_tuple):
+    def update_biases(self, model, router_data_tuple, accelerator):
         """
-        Updated to avoid DDP deadlock. Computes local updates only.
-        Since expert_biases are registered buffers, DDP will broadcast them automatically
-        during the forward pass if broadcast_buffers=True (default).
+        Prevents MoE biases from drifting apart across different GPUs.
         """
         if not router_data_tuple:
             return
@@ -42,19 +41,26 @@ class LossFreeBalancer:
                 continue
 
             _, topk_indices = layer_data
-            local_counts = torch.bincount(
-                topk_indices.flatten(), minlength=self.num_experts
-            ).float()
+            local_counts = (
+                torch.bincount(topk_indices.flatten(), minlength=self.num_experts)
+                .float()
+                .to(accelerator.device)
+            )
 
-            avg_count = local_counts.mean()
-            error = avg_count - local_counts
+            # Synchronize local bincounts across all ranks
+            if accelerator.num_processes > 1:
+                global_counts = accelerator.reduce(local_counts, reduction="sum")
+            else:
+                global_counts = local_counts
+
+            avg_count = global_counts.mean()
+            error = avg_count - global_counts
             error_ratio = error / (avg_count + 1e-8)
             update_step = self.update_rate * error_ratio.clamp(-5.0, 5.0)
 
             moe_module = self._get_module_by_index(model, i)
             if moe_module is not None and hasattr(moe_module, "expert_biases"):
-                device = moe_module.expert_biases.device
-                moe_module.expert_biases.data.add_(update_step.to(device))
+                moe_module.expert_biases.data.add_(update_step)
 
     def _get_module_by_index(self, model, index):
         if not hasattr(model, "dt_cross_attention"):
@@ -117,7 +123,9 @@ def train_one_epoch(
     args,
 ):
     model.train()
-    loss_meter, bpp_meter, dist_meter = AverageMeter(), AverageMeter(), AverageMeter()
+    loss_meter = AverageMeter()
+    bpp_meter = AverageMeter()
+    dist_meter = AverageMeter()
     bias_stats_logged = False
 
     for i, batch in enumerate(train_dataloader):
@@ -128,15 +136,33 @@ def train_one_epoch(
         out_criterion = criterion(out_net, batch)
         loss = out_criterion["loss"]
 
+        unwrapped_model = accelerator.unwrap_model(model)
+        ortho_loss = 0.0
+        dict_count = 0
+        for module in unwrapped_model.modules():
+            if hasattr(module, "experts_high") and isinstance(
+                module.experts_high, nn.Parameter
+            ):
+                W = module.experts_high
+                W_norm = F.normalize(W, p=2, dim=-1)
+                sim_matrix = torch.matmul(W_norm, W_norm.transpose(0, 1))
+                eye = torch.eye(sim_matrix.shape[0], device=sim_matrix.device)
+                ortho_loss += F.mse_loss(sim_matrix, eye)
+                dict_count += 1
+
+        if dict_count > 0:
+            loss = loss + (0.01 * (ortho_loss / dict_count))
+
         accelerator.backward(loss)
         if clip_max_norm > 0:
             accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
-        unwrapped_model = accelerator.unwrap_model(model)
-
+        # Update biases natively utilizing DDP accelerator synchronization
         if "router_logits" in out_net and out_net["router_logits"]:
-            balancer.update_biases(unwrapped_model, out_net["router_logits"])
+            balancer.update_biases(
+                unwrapped_model, out_net["router_logits"], accelerator
+            )
 
         aux_loss = unwrapped_model.aux_loss()
         accelerator.backward(aux_loss)
@@ -155,6 +181,11 @@ def train_one_epoch(
             )
             writer.add_scalar("Train/Loss", loss_meter.val, global_step)
             writer.add_scalar("Train/Bpp", bpp_meter.val, global_step)
+            writer.add_scalar(
+                "Train/MoE_Imbalance",
+                out_criterion.get("moe_imbalance", 0.0),
+                global_step,
+            )
 
             if not bias_stats_logged and hasattr(unwrapped_model, "dt_cross_attention"):
                 if hasattr(unwrapped_model.dt_cross_attention[0], "expert_biases"):
@@ -196,6 +227,7 @@ def test_epoch(epoch, test_dataloader, model, criterion, accelerator, logger, wr
             f"Test Epoch [{epoch}] Loss: {loss_meter.avg:.4f} | Bpp: {bpp_meter.avg:.4f} | PSNR: {psnr_meter.avg:.2f} dB"
         )
         writer.add_scalar("Val/Loss", loss_meter.avg, epoch)
+        writer.add_scalar("Val/PSNR", psnr_meter.avg, epoch)
     return loss_meter.avg
 
 
@@ -291,6 +323,15 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_scheduler.load_state_dict(checkpoint["scheduler"])
         best_loss = checkpoint.get("loss", best_loss)
+
+        ema_ckpt_path = args.checkpoint.replace(
+            "checkpoint.pth.tar", "checkpoint_ema.pth.tar"
+        )
+        if os.path.exists(ema_ckpt_path):
+            ema_ckpt = torch.load(ema_ckpt_path, map_location="cpu")
+            ema_model.module.load_state_dict(ema_ckpt["state_dict"])
+            if accelerator.is_main_process:
+                logger.info("Successfully loaded EMA weights.")
 
     net, optimizer, aux_optimizer, train_dataloader, test_dataloader, lr_scheduler = (
         accelerator.prepare(

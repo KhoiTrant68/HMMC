@@ -37,7 +37,7 @@ def compute_msssim(a, b):
 def compute_bpp_estimated(out_net, num_pixels):
     bpp = 0
     for likelihoods in out_net["likelihoods"].values():
-        bpp += torch.log2(likelihoods).sum() / (-num_pixels)
+        bpp += torch.log2(likelihoods.clamp(min=1e-9)).sum() / (-num_pixels)
     return bpp.item()
 
 
@@ -103,13 +103,22 @@ def main(argv):
         orig_shape = x.size()
         orig_h, orig_w = orig_shape[2], orig_shape[3]
         num_pixels = orig_shape[0] * orig_h * orig_w
+        pad_h = (64 - (orig_h % 64)) % 64
+        pad_w = (64 - (orig_w % 64)) % 64
+        x_pad = (
+            F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+            if (pad_h > 0 or pad_w > 0)
+            else x
+        )
 
         with torch.no_grad():
             if args.real:
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_start = time.time()
-                out_enc = net.compress(x)
+
+                out_enc = net.compress(x_pad)
+
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_enc = time.time() - t_start
@@ -117,14 +126,17 @@ def main(argv):
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_start = time.time()
+
                 out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
+
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_dec = time.time() - t_start
 
-                # Safe crop applied just in case ConvTranspose2d output_padding creates a +1 spatial dimension mismatch
+                # Unpad/Crop back to original resolution safely
                 x_hat = out_dec["x_hat"][:, :, :orig_h, :orig_w].clamp_(0, 1)
 
+                # Count BPP explicitly on the unpadded pixel target
                 y_bits = len(out_enc["strings"][0][0]) * 8.0
                 z_bits = sum(len(s) for s in out_enc["strings"][1]) * 8.0
                 current_bpp = (y_bits + z_bits) / num_pixels
@@ -136,14 +148,14 @@ def main(argv):
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_start = time.time()
-                out_net = net(x, training_mode="ste")
+
+                out_net = net(x_pad, training_mode="ste")
+
                 if args.cuda:
                     torch.cuda.synchronize()
                 t_total = time.time() - t_start
 
-                # Safe crop applied just in case ConvTranspose2d output_padding creates a +1 spatial dimension mismatch
                 x_hat = out_net["x_hat"][:, :, :orig_h, :orig_w].clamp_(0, 1)
-
                 current_bpp = compute_bpp_estimated(out_net, num_pixels)
                 metrics["time_total"] += t_total
 
