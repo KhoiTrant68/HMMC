@@ -47,7 +47,6 @@ class LossFreeBalancer:
                 .to(accelerator.device)
             )
 
-            # Synchronize local bincounts across all ranks
             if accelerator.num_processes > 1:
                 global_counts = accelerator.reduce(local_counts, reduction="sum")
             else:
@@ -144,9 +143,16 @@ def train_one_epoch(
                 module.experts_high, nn.Parameter
             ):
                 W = module.experts_high
-                W_norm = F.normalize(W, p=2, dim=-1)
-                sim_matrix = torch.matmul(W_norm, W_norm.transpose(0, 1))
-                eye = torch.eye(sim_matrix.shape[0], device=sim_matrix.device)
+                num_experts = module.num_experts
+                W_reshaped = W.view(num_experts, -1, W.shape[-1])
+                W_norm = F.normalize(W_reshaped, p=2, dim=-1)
+
+                sim_matrix = torch.matmul(W_norm, W_norm.transpose(-1, -2))
+                eye = (
+                    torch.eye(sim_matrix.shape[-1], device=sim_matrix.device)
+                    .unsqueeze(0)
+                    .expand_as(sim_matrix)
+                )
                 ortho_loss += F.mse_loss(sim_matrix, eye)
                 dict_count += 1
 
@@ -158,7 +164,6 @@ def train_one_epoch(
             accelerator.clip_grad_norm_(model.parameters(), clip_max_norm)
         optimizer.step()
 
-        # Update biases natively utilizing DDP accelerator synchronization
         if "router_logits" in out_net and out_net["router_logits"]:
             balancer.update_biases(
                 unwrapped_model, out_net["router_logits"], accelerator

@@ -32,6 +32,12 @@ class RateDistortionLoss(nn.Module):
         self.use_loss_free_balancing = use_loss_free_balancing
         self.mse = nn.MSELoss()
 
+        if self.loss_type == "ms_ssim" and self.lmbda < 0.1:
+            print(
+                f"WARNING: lmbda={self.lmbda} is likely tuned for MSE. "
+                f"For MS-SSIM, distortion magnitudes are small. Use lmbda in range [1.0, 100.0]"
+            )
+
     def forward(self, output, target):
         N, _, H, W = target.size()
         num_pixels = N * H * W

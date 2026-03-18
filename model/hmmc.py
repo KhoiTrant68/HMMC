@@ -275,9 +275,9 @@ class InverseLearnableWaveletTransform(nn.Module):
 
     def forward(self, ll, hf):
         C = ll.shape[1]
-        lh, hl, hh = torch.split(hf, C, dim=1)
-        l_horz = self._inverse_lifting(ll, lh, self.P_vert, self.U_vert, dim=2)
-        h_horz = self._inverse_lifting(hl, hh, self.P_vert, self.U_vert, dim=2)
+        hl, lh, hh = torch.split(hf, C, dim=1)
+        l_horz = self._inverse_lifting(ll, hl, self.P_vert, self.U_vert, dim=2)
+        h_horz = self._inverse_lifting(lh, hh, self.P_vert, self.U_vert, dim=2)
         x = self._inverse_lifting(l_horz, h_horz, self.P_horz, self.U_horz, dim=3)
         return x
 
@@ -345,6 +345,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self.scale = c_block**-0.5
         self.dict_low = nn.Parameter(torch.randn(64, c_block))
 
+        self.router_ln = nn.LayerNorm(self.dim_high + c_block)
         self.router = nn.Sequential(
             nn.Linear(self.dim_high + c_block, self.dim_high),
             nn.GELU(),
@@ -398,7 +399,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
     def process_high_freq_guided(self, hf, lf):
         B, H, W, C_high = hf.shape
-        routing_logits = self.router(torch.cat([hf, lf], dim=-1))
+        routing_logits = self.router(self.router_ln(torch.cat([hf, lf], dim=-1)))
         biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
 
         topk_probs, topk_indices = torch.topk(
@@ -406,7 +407,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         )
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        q = self.q_high(self.ln_high(hf)).view(B * H * W, 1, C_high)
+        q = self.q_high(self.ln_high(hf)).view(B * H * W, C_high)
 
         reshaped_keys = self.k_high(self.ln_dict_high(self.experts_high)).view(
             self.num_experts, -1, C_high
@@ -415,22 +416,29 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
 
         final_out = torch.zeros(B * H * W, C_high, device=hf.device, dtype=hf.dtype)
 
+        # Process specifically masked pixels per expert
         for k_idx in range(2):
-            expert_idx = topk_indices[..., k_idx].view(-1)
-            K_sel = reshaped_keys[expert_idx]
-            V_sel = reshaped_vals[expert_idx]
+            expert_indices_k = topk_indices[..., k_idx].view(-1)
+            probs_k = topk_probs[..., k_idx].view(-1, 1)
 
-            attn = torch.matmul(q, K_sel.transpose(1, 2)) * (C_high**-0.5)
-            attn = F.softmax(attn, dim=-1)
+            for exp_id in range(self.num_experts):
+                mask = expert_indices_k == exp_id
+                if not mask.any():
+                    continue
 
-            expert_out = torch.matmul(attn, V_sel).view(B * H * W, C_high)
-            weight = topk_probs[..., k_idx].view(B * H * W, 1)
-            final_out += expert_out * weight
+                q_masked = q[mask]  # [num_tokens_for_expert, C_high]
+                k_exp = reshaped_keys[exp_id]  # [expert_entries, C_high]
+                v_exp = reshaped_vals[exp_id]  # [expert_entries, C_high]
+
+                attn = torch.matmul(q_masked, k_exp.transpose(0, 1)) * (C_high**-0.5)
+                attn = F.softmax(attn, dim=-1)
+
+                expert_out = torch.matmul(attn, v_exp)
+                final_out[mask] += expert_out * probs_k[mask]
 
         return final_out.view(B, H, W, C_high), (routing_logits, topk_indices)
 
     def forward(self, x):
-        shortcut = x
         x_emb = self.x_trans(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         ll, hf = self.dwt(x_emb)
@@ -445,8 +453,6 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         recon = recon + self.res_scale_2(self.mlp(self.ln_mlp(recon)))
 
         out = self.output_trans(recon.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        if self.input_dim == self.output_dim:
-            out = out + shortcut
         return out, routing_data
 
 
@@ -557,9 +563,7 @@ class HMMC(CompressionModel):
         self.scale_transforms = nn.ModuleList()
         self.lrp_transforms = nn.ModuleList()
 
-        bottleneck_dim = (
-            192  # Fixed query dimension stops quadratic parameter explosion
-        )
+        bottleneck_dim = 192
         cum_channels = 0
 
         for i in range(self.num_standard_slices):
@@ -668,8 +672,7 @@ class HMMC(CompressionModel):
             nn.Conv2d(224, out_na_dim, 3, 1, 1),
         )
 
-        # Entropy bottleneck correctly tied to N
-        self.entropy_bottleneck = EntropyBottleneck(192)  # Compressed latent rep
+        self.entropy_bottleneck = EntropyBottleneck(192)
         self.gaussian_conditional = GaussianConditional(None)
 
     def update(self, scale_table=None, force=False):

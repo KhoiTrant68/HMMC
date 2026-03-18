@@ -77,7 +77,18 @@ def main(argv):
     print(f"Loading model from {args.checkpoint}...")
     net = HMMC(N=192, M=320).to(device)
 
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    # Auto-load EMA weights if they exist (crucial for +0.2dB compression baseline)
+    ema_path = Path(args.checkpoint).with_name(
+        Path(args.checkpoint).name.replace(
+            "checkpoint.pth.tar", "checkpoint_ema.pth.tar"
+        )
+    )
+    if ema_path.exists():
+        print(f"EMA weights found. Loading from {ema_path}...")
+        checkpoint = torch.load(ema_path, map_location=device)
+    else:
+        checkpoint = torch.load(args.checkpoint, map_location=device)
+
     state_dict = {
         k.replace("module.", ""): v
         for k, v in checkpoint.get("state_dict", checkpoint).items()
@@ -106,7 +117,7 @@ def main(argv):
         pad_h = (64 - (orig_h % 64)) % 64
         pad_w = (64 - (orig_w % 64)) % 64
         x_pad = (
-            F.pad(x, (0, pad_w, 0, pad_h), mode="reflect")
+            F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
             if (pad_h > 0 or pad_w > 0)
             else x
         )
