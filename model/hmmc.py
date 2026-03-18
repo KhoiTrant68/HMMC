@@ -317,7 +317,7 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         self,
         input_dim,
         output_dim,
-        mlp_rate=4,
+        mlp_rate=2,
         head_num=4,
         qkv_bias=True,
         num_experts=4,
@@ -401,13 +401,11 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         routing_logits = self.router(torch.cat([hf, lf], dim=-1))
         biased_logits = routing_logits + self.expert_biases.view(1, 1, 1, -1)
 
-        # Sparse routing: O(K) execution
         topk_probs, topk_indices = torch.topk(
             F.softmax(biased_logits, dim=-1), k=2, dim=-1
         )
         topk_probs = topk_probs / (topk_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # CRITICAL FIX: Ensure exact 3D shape (B*H*W, 1, C_high) for batch matrix multiplication
         q = self.q_high(self.ln_high(hf)).view(B * H * W, 1, C_high)
 
         reshaped_keys = self.k_high(self.ln_dict_high(self.experts_high)).view(
@@ -415,12 +413,10 @@ class SpectralMoEDictionaryCrossAttention(nn.Module):
         )
         reshaped_vals = self.v_all(self.experts_high).view(self.num_experts, -1, C_high)
 
-        # Track the accumulated output exactly on the flatted space
         final_out = torch.zeros(B * H * W, C_high, device=hf.device, dtype=hf.dtype)
 
         for k_idx in range(2):
             expert_idx = topk_indices[..., k_idx].view(-1)
-
             K_sel = reshaped_keys[expert_idx]
             V_sel = reshaped_vals[expert_idx]
 
@@ -482,22 +478,22 @@ class CheckerboardMerger(nn.Module):
 
 
 # ==========================================
-# PART 6: INTEGRATED MODEL
+# PART 6: INTEGRATED MODEL (SOTA ALIGNED)
 # ==========================================
 
 
 class HMMC(CompressionModel):
-    def __init__(self, N=192, M=320):
+    def __init__(self, N=128, M=256):
         super().__init__()
         self.N = N
         self.M = M
 
-        self.groups = [0, 16, 16, 32, 64, 192]
-        self.num_standard_slices = len(self.groups) - 2
+        self.groups = [0, 16, 32, 72, 136]  # Sums perfectly to M=256
+        self.num_standard_slices = len(self.groups) - 2  # 3 standard slices
         self.last_slice_dim = self.groups[-1]
 
-        feature_dim = [96, 144, 256]
-        block_counts = [2, 3, 6]
+        feature_dim = [96, 128, 192]
+        block_counts = [2, 2, 4]
 
         self.g_a = nn.Sequential(
             ConvBottleneckBlockWithStride(3, feature_dim[0]),
@@ -553,26 +549,36 @@ class HMMC(CompressionModel):
             ConvBottleneckBlockWithUpsample(N, M),
         )
 
+        # Context components
+        self.context_bottlenecks = nn.ModuleList()
         self.dt_cross_attention = nn.ModuleList()
         self.context_transforms = nn.ModuleList()
         self.mean_transforms = nn.ModuleList()
         self.scale_transforms = nn.ModuleList()
         self.lrp_transforms = nn.ModuleList()
 
+        bottleneck_dim = (
+            192  # Fixed query dimension stops quadratic parameter explosion
+        )
         cum_channels = 0
+
         for i in range(self.num_standard_slices):
             current_dim = self.groups[i + 1]
-            moe_input_dim = (M * 2) + cum_channels
+            raw_query_dim = (M * 2) + cum_channels
+
+            self.context_bottlenecks.append(nn.Conv2d(raw_query_dim, bottleneck_dim, 1))
+
             self.dt_cross_attention.append(
                 SpectralMoEDictionaryCrossAttention(
-                    input_dim=moe_input_dim,
+                    input_dim=bottleneck_dim,
                     output_dim=M,
-                    head_num=8,
-                    mlp_rate=4,
+                    head_num=4,
+                    mlp_rate=2,
                     num_experts=4,
                 )
             )
-            support_dim = M + (M * 2) + cum_channels
+
+            support_dim = M + bottleneck_dim
             self.context_transforms.append(NAFBlock(support_dim, inter_dim=128))
             self.mean_transforms.append(
                 nn.Sequential(
@@ -605,14 +611,17 @@ class HMMC(CompressionModel):
         self.checkerboard_split = CheckerboardSplitter()
         self.checkerboard_merge = CheckerboardMerger()
 
+        # Anchor Context
+        raw_query_dim_anc = (M * 2) + cum_channels
+        self.anc_bottleneck = nn.Conv2d(raw_query_dim_anc, bottleneck_dim, 1)
         self.moe_anchor = SpectralMoEDictionaryCrossAttention(
-            input_dim=(M * 2) + cum_channels,
+            input_dim=bottleneck_dim,
             output_dim=M,
-            head_num=8,
-            mlp_rate=4,
+            head_num=4,
+            mlp_rate=2,
             num_experts=4,
         )
-        support_dim_anc = M + (M * 2) + cum_channels
+        support_dim_anc = M + bottleneck_dim
         self.naf_anchor = NAFBlock(support_dim_anc, inter_dim=128)
         self.mean_anchor = nn.Sequential(
             nn.Conv2d(support_dim_anc, 224, 3, 1, 1),
@@ -630,15 +639,17 @@ class HMMC(CompressionModel):
             nn.Conv2d(224, self.last_slice_dim, 3, 1, 1),
         )
 
-        fusion_input_dim = (M * 2) + cum_channels + self.last_slice_dim
+        # Non-Anchor Context
+        raw_query_dim_na = (M * 2) + cum_channels + self.last_slice_dim
+        self.na_bottleneck = nn.Conv2d(raw_query_dim_na, bottleneck_dim, 1)
         self.moe_non_anchor = SpectralMoEDictionaryCrossAttention(
-            input_dim=fusion_input_dim,
+            input_dim=bottleneck_dim,
             output_dim=M,
-            head_num=8,
-            mlp_rate=4,
+            head_num=4,
+            mlp_rate=2,
             num_experts=4,
         )
-        support_dim_na = M + fusion_input_dim
+        support_dim_na = M + bottleneck_dim
         self.naf_non_anchor = NAFBlock(support_dim_na, inter_dim=128)
         out_na_dim = self.last_slice_dim * 3
         self.mean_non_anchor = nn.Sequential(
@@ -657,7 +668,8 @@ class HMMC(CompressionModel):
             nn.Conv2d(224, out_na_dim, 3, 1, 1),
         )
 
-        self.entropy_bottleneck = EntropyBottleneck(192)
+        # Entropy bottleneck correctly tied to N
+        self.entropy_bottleneck = EntropyBottleneck(192)  # Compressed latent rep
         self.gaussian_conditional = GaussianConditional(None)
 
     def update(self, scale_table=None, force=False):
@@ -685,11 +697,12 @@ class HMMC(CompressionModel):
 
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
-            query = (
+            query_raw = (
                 hyper_info
                 if i == 0
                 else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
             )
+            query = self.context_bottlenecks[i](query_raw)
 
             dict_info, routing_data = self.dt_cross_attention[i](query)
             all_logits.append(routing_data)
@@ -718,7 +731,9 @@ class HMMC(CompressionModel):
         prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc_raw = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc = self.anc_bottleneck(query_anc_raw)
+
         dict_info_anc, routing_data_anc = self.moe_anchor(query_anc)
         all_logits.append(routing_data_anc)
 
@@ -734,7 +749,9 @@ class HMMC(CompressionModel):
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        query_na = torch.cat([query_anc, y_hat_anc], dim=1)
+        query_na_raw = torch.cat([query_anc_raw, y_hat_anc], dim=1)
+        query_na = self.na_bottleneck(query_na_raw)
+
         dict_info_na, routing_data_na = self.moe_non_anchor(query_na)
         all_logits.append(routing_data_na)
 
@@ -786,11 +803,12 @@ class HMMC(CompressionModel):
 
         for i in range(self.num_standard_slices):
             y_slice = y_slices[i]
-            query = (
+            query_raw = (
                 hyper_info
                 if i == 0
                 else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
             )
+            query = self.context_bottlenecks[i](query_raw)
 
             dict_info, _ = self.dt_cross_attention[i](query)
             support_feat = self.context_transforms[i](
@@ -822,7 +840,9 @@ class HMMC(CompressionModel):
         prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc_raw = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc = self.anc_bottleneck(query_anc_raw)
+
         dict_anc, _ = self.moe_anchor(query_anc)
         feat_anc = self.naf_anchor(torch.cat([dict_anc, query_anc], dim=1))
         mu_anc, scale_anc = self.mean_anchor(feat_anc), self.scale_anchor(feat_anc)
@@ -842,7 +862,9 @@ class HMMC(CompressionModel):
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        query_na = torch.cat([query_anc, y_hat_anc], dim=1)
+        query_na_raw = torch.cat([query_anc_raw, y_hat_anc], dim=1)
+        query_na = self.na_bottleneck(query_na_raw)
+
         dict_na, _ = self.moe_non_anchor(query_na)
         feat_na = self.naf_non_anchor(torch.cat([dict_na, query_na], dim=1))
         mu_na, scale_na = self.mean_non_anchor(feat_na), self.scale_non_anchor(feat_na)
@@ -884,11 +906,12 @@ class HMMC(CompressionModel):
         y_hat_slices = []
 
         for i in range(self.num_standard_slices):
-            query = (
+            query_raw = (
                 hyper_info
                 if i == 0
                 else torch.cat([hyper_info, torch.cat(y_hat_slices, dim=1)], dim=1)
             )
+            query = self.context_bottlenecks[i](query_raw)
 
             dict_info, _ = self.dt_cross_attention[i](query)
             support_feat = self.context_transforms[i](
@@ -898,8 +921,8 @@ class HMMC(CompressionModel):
             scale = self.scale_transforms[i](support_feat)[
                 :, :, : y_shape[0], : y_shape[1]
             ]
-            index = self.gaussian_conditional.build_indexes(scale)
 
+            index = self.gaussian_conditional.build_indexes(scale)
             rv = decoder.decode_stream(
                 index.reshape(-1).tolist(), cdf, cdf_lengths, offsets
             )
@@ -916,7 +939,9 @@ class HMMC(CompressionModel):
         prev_slices_down = self.prev_slices_down(torch.cat(y_hat_slices, dim=1))
         hyper_down = self.hyper_down(hyper_info)
 
-        query_anc = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc_raw = torch.cat([hyper_down, prev_slices_down], dim=1)
+        query_anc = self.anc_bottleneck(query_anc_raw)
+
         dict_anc, _ = self.moe_anchor(query_anc)
         feat_anc = self.naf_anchor(torch.cat([dict_anc, query_anc], dim=1))
         mu_anc, scale_anc = self.mean_anchor(feat_anc), self.scale_anchor(feat_anc)
@@ -934,7 +959,9 @@ class HMMC(CompressionModel):
         lrp_anc = self.lrp_anchor(torch.cat([feat_anc, y_hat_anc], dim=1))
         y_hat_anc = y_hat_anc + (0.5 * torch.tanh(lrp_anc))
 
-        query_na = torch.cat([query_anc, y_hat_anc], dim=1)
+        query_na_raw = torch.cat([query_anc_raw, y_hat_anc], dim=1)
+        query_na = self.na_bottleneck(query_na_raw)
+
         dict_na, _ = self.moe_non_anchor(query_na)
         feat_na = self.naf_non_anchor(torch.cat([dict_na, query_na], dim=1))
         mu_na, scale_na = self.mean_non_anchor(feat_na), self.scale_non_anchor(feat_na)
@@ -967,11 +994,11 @@ class HMMC(CompressionModel):
     @classmethod
     def from_state_dict(cls, state_dict):
         try:
-            N = state_dict["g_a.0.conv_down.weight"].size(0)
+            N = state_dict["h_a.0.conv_down.weight"].size(0)
             M = state_dict["g_a.6.weight"].size(0)
         except KeyError:
-            N = 192
-            M = 320
+            N = 128
+            M = 256
         net = cls(N=N, M=M)
         net.load_state_dict(state_dict)
         return net
